@@ -1,0 +1,10 @@
+   
+long long getTotalVirMem(pid_t pid);
+
+long long getProcessVirMem(pid_t pid);
+
+long long getTotalPhyMem(pid_t pid);
+
+long long getProcessPhyMem(pid_t pid);
+
+long long getProcessCpuTime(pid_t pid);
