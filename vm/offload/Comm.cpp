@@ -97,9 +97,187 @@ void offAddTrackedObject(Object* obj) {
       memset(info->bits, 0xFF, ((maxField - 1) >> 5) << 2);
     }
 
-    offAddToWriteQueueLocked(obj);
+    if(gDvm.isServer) {
+      offAddToWriteQueueLocked(obj);
+    }
     pthread_mutex_unlock(&gDvm.offCommLock);
   }
+}
+
+void offAddObjectIntoTrack(Object* obj, ObjectAccResult* objAccInfo, bool allFlag) {
+  //ALOGE("enter method offAddObjectIntoTrack, obj is: %p, objAccInfo is: %p, allFlag is: %d", obj, objAccInfo, allFlag);
+  if(obj == NULL) {
+    return;
+  }
+  if(obj->objId == COMM_INVALID_ID) {
+    pthread_mutex_lock(&gDvm.offCommLock);
+    while(!addTrackedObjectIdLocked(obj, ADD_ID_MASK(gDvm.nextId++)));
+
+    u4 maxField = getMaxFieldIndex(obj);
+    ObjectInfo* info = offIdObjectInfo(obj->objId);
+    memset(&info->dirty, 0xFF, sizeof(info->dirty));
+    if(maxField > 32) {
+      memset(info->bits, 0xFF, ((maxField - 1) >> 5) << 2);
+    }
+
+    pthread_mutex_unlock(&gDvm.offCommLock);
+  }
+  ObjectInfo* info = offIdObjectInfo(obj->objId);
+   if(!info->isQueued) {
+    pthread_mutex_lock(&gDvm.offCommLock);
+    if(!info->isQueued) {
+      info->isQueued = true;
+      offAddToWriteQueueLocked(obj);
+      pthread_mutex_unlock(&gDvm.offCommLock);
+      if(objAccInfo != NULL) {
+        info->allFlag = allFlag;
+        info->migrate = objAccInfo->migrate;
+        u4 maxFields = getMaxFieldIndex(obj);
+        u4 fsz = (maxFields - 1) >> 5;
+        info->highbits = maxFields > 32 ? (u4*)calloc(fsz, 4) : (u4*)NULL;
+        if(info->highbits != NULL && objAccInfo->highbits != NULL) {
+          u4 asz = (objAccInfo->fieldSet.size() - 1) >> 5;
+          memcpy(info->highbits, objAccInfo->highbits, (fsz < asz ? fsz : asz) << 2);
+        }
+        offAddFieldsIntoTrack(obj, objAccInfo, objAccInfo->allFlag);
+      } else if(allFlag) {
+        info->allFlag = true;
+        offAddFieldsIntoTrack(obj, NULL, true);
+      }
+    } else {
+      pthread_mutex_unlock(&gDvm.offCommLock);
+      if(objAccInfo != NULL) {
+        mergeMigrateInfo(obj, objAccInfo, objAccInfo->allFlag);
+      } else if(allFlag) {
+        mergeMigrateInfo(obj, NULL, true);
+      }
+    }
+  } else {
+    if(objAccInfo != NULL) {
+      mergeMigrateInfo(obj, objAccInfo, objAccInfo->allFlag);
+    } else if(allFlag) {
+      mergeMigrateInfo(obj, NULL, true);
+    }
+  }
+}
+
+void offAddFieldsIntoTrack(Object* obj, ObjectAccResult* objAccInfo, bool allFlag) {
+  //ALOGE("enter method offAddFieldsIntoTrack, obj is: %p, objId is: %d, objAccInfo is: %p, allFlag is: %d", obj, obj->objId, objAccInfo, allFlag);
+  if(obj == NULL) {
+    return;
+  }
+  if(isClassObject(obj)) {
+    /* To sync class objects we just write out all of its globals. */
+    ClassObject* clazz = (ClassObject*)obj;
+
+    StaticField* fld = clazz->sfields;
+    if(allFlag) {
+      StaticField* efld = fld + clazz->sfieldCount;
+      for(; fld != efld; ++fld) {
+        if(*fld->signature != '[' && *fld->signature != 'L') {
+          continue;
+        }
+        JValue* val = &fld->value;
+        Object* fldObj = (Object*) val->l;
+        offAddObjectIntoTrack(fldObj, NULL, true);
+      }
+    } else if(objAccInfo != NULL) {
+      unsigned int count = ((unsigned int) clazz->sfieldCount < objAccInfo->fieldSet.size()) ? clazz->sfieldCount : objAccInfo->fieldSet.size();
+      for(unsigned int offset = 0; offset < count; offset++, ++fld) {
+        if(objAccInfo->fieldSet[offset] == NULL) {
+          continue;
+        }
+        if(*fld->signature != '[' && *fld->signature != 'L') {
+          continue;
+        }
+        JValue* val = &fld->value;
+        Object* fldObj = (Object*) val->l;
+        offAddObjectIntoTrack(fldObj, objAccInfo->fieldSet[offset], objAccInfo->fieldSet[offset]->allFlag);
+      }
+    }
+    return;
+  }
+  ClassObject* clazz = obj->clazz;
+  if(*clazz->descriptor == '[') {
+    // For array, the static analysis will only treat it as migrate all or not migrate
+    if(!allFlag) {
+      return;
+    }
+    /* For array objects we send the whole array contents for now. */
+    ArrayObject* aobj = (ArrayObject*)obj;
+    char type = aobj->clazz->descriptor[1];
+    if(type != '[' && type != 'L') {
+      return;
+    }
+    char* contents = (char*)aobj->contents;
+
+    u4 typeWidth = auxTypeWidth(type);
+    for(u4 i = 0; i < aobj->length; i++, contents += typeWidth) {
+      JValue* val = (JValue*) contents;
+      Object* fldObj = (Object*) val->l;
+      offAddObjectIntoTrack(fldObj, NULL, true);
+    }
+  } else {
+    /* For normal class objects we write out all the instance fields. */
+    for(; clazz; clazz = clazz->super) {
+      InstField* fld = clazz->ifields;
+      InstField* efld = fld + clazz->ifieldCount;
+      for(; fld != efld; ++fld) {
+        if(*fld->signature != '[' && *fld->signature != 'L') {
+          continue;
+        }
+        JValue* val = (JValue*) ((char*)obj + fld->byteOffset);
+        Object* fldObj = (Object*) val->l;
+        unsigned int offset = (fld->byteOffset - sizeof(Object)) >> 2;
+        if(objAccInfo != NULL && objAccInfo->fieldSet.size() > offset && objAccInfo->fieldSet[offset] != NULL) {
+          offAddObjectIntoTrack(fldObj, objAccInfo->fieldSet[offset], objAccInfo->fieldSet[offset]->allFlag);
+        } else if(allFlag) {
+          offAddObjectIntoTrack(fldObj, NULL, true);
+        }
+      }
+    }
+  }
+}
+
+void mergeMigrateInfo(Object* obj, ObjectAccResult* objAccInfo, bool allFlag) {
+  //ALOGE("enter method mergeMigrateInfo, obj is: %p, objAccInfo is: %p, allFlag is: %d", obj, objAccInfo, allFlag);
+  ObjectInfo* info = offIdObjectInfo(obj->objId);
+  if(info->allFlag) {
+    // if the object has already been marked as migrate all, we do not need to merge anything
+    return;
+  }
+  if(objAccInfo != NULL) {
+    info->allFlag = allFlag;
+    info->migrate = info->migrate | objAccInfo->migrate;
+    u4 maxFields = getMaxFieldIndex(obj);
+    u4 fsz = (maxFields - 1) >> 5;
+    if(info->highbits != NULL && objAccInfo->highbits != NULL) {
+      u4 asz = (objAccInfo->fieldSet.size() - 1) >> 5;
+      for(u4 i = 0; i < (fsz < asz ? fsz : asz); i++) {
+        *(info->highbits + i) = *(info->highbits + i) | *(objAccInfo->highbits + i);
+      }
+    }
+    offAddFieldsIntoTrack(obj, objAccInfo, allFlag);
+  } else if(allFlag) {
+    info->allFlag = true;
+    offAddFieldsIntoTrack(obj, NULL, true);
+  }
+}
+
+static bool isObjectDirty(ObjectInfo* info) {
+  if(info->dirty != 0) {
+    return true;
+  }
+  u4 maxFields = getMaxFieldIndex(info->obj);
+  if(maxFields > 32) {
+    u4 fsz = (maxFields - 1) >> 5;
+    for(u4 i = 0; i < fsz; i++) {
+      if(*(info->bits + i) != 0) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 static bool isFieldDirtyRaw(u4 dirty, u4* bits, u4 fieldIndex) {
@@ -113,6 +291,23 @@ static bool isFieldDirty(ObjectInfo* info, u4 fieldIndex) {
   return isFieldDirtyRaw(info->dirty, info->bits, fieldIndex);
 }
 
+static bool isFieldMigrateRaw(u4 migrate, u4* highbits, u4 fieldIndex) {
+  if(fieldIndex < 32) {
+    return (migrate & 1U << fieldIndex) != 0;
+  }
+  if(highbits == NULL) {
+    return false;
+  }
+  return (highbits[(fieldIndex - 32) >> 5] & (1U << (fieldIndex & 0x1F))) != 0;
+}
+
+static bool isFieldMigrate(ObjectInfo* info, u4 fieldIndex) {
+  if(info->allFlag) {
+    return true;
+  }
+  return isFieldMigrateRaw(info->migrate, info->highbits, fieldIndex);
+}
+
 /* Only allowed in sync operations.  Clear a dirty bit.  Intended to be used in
  * syncPull when the other endpoint overwrites something. */
 static void clearDirty(ObjectInfo* info, u4 fieldIndex) {
@@ -120,6 +315,13 @@ static void clearDirty(ObjectInfo* info, u4 fieldIndex) {
     info->dirty &= ~(1U << fieldIndex);
   } else {
     info->bits[(fieldIndex - 32) >> 5] &= ~(1U << (fieldIndex & 0x1F));
+  }
+}
+
+static int addStatusUpdate(ClassObject* clazz, void* arg) {
+  UNUSED_PARAMETER(arg);
+  if(clazz->status < CLASS_INITIALIZING) {
+    return;
   }
 }
 
@@ -158,12 +360,16 @@ static void writeValue(FifoBuffer* fb, char type, JValue* val) {
         assert(objId != COMM_INVALID_ID);
 
         writeU4(fb, auxObjectToId((Object*)obj->clazz));
+        ALOGE("write object clazz id: %d, descriptor: %s", auxObjectToId((Object*)obj->clazz), obj->clazz->descriptor);
         writeU4(fb, objId);
+        ALOGE("write object instance id: %d", objId);
         if(*obj->clazz->descriptor == '[') {
           ArrayObject* aobj = (ArrayObject*)obj;
           writeU4(fb, aobj->length);
+          ALOGE("write array instance length: %d", aobj->length);
         }
       } else {
+        ALOGE("write object null id: %d", COMM_INVALID_ID);
         writeU4(fb, COMM_INVALID_ID);
       }
     } break;
@@ -182,13 +388,22 @@ static void readValue(Thread* self, FifoBuffer* fb, char type,
     case 'D': case 'J': val->j = readU8(fb); break;
     case '[': case 'L': {
       u4 clId = readU4(fb);
+      ALOGE("read object clazz id: %d", clId);
+      if(clId == (u4) -922746828) {
+        ALOGE("find the object before");
+      }
       if(clId == COMM_INVALID_ID) {
         val->l = NULL;
       } else {
         ClassObject* clazz = (ClassObject*)offIdToObject(clId);
+        if(clazz == NULL) {
+            ALOGE("clazz is null, its id is: %d", clId);
+        }
         assert(clazz->clazz == gDvm.classJavaLangClass);
         u4 objId = readU4(fb);
+        ALOGE("read object instance id: %d, , descriptor: %s", objId, clazz->descriptor);
         u4 arrLength = *clazz->descriptor == '[' ? readU4(fb) : 0;
+        ALOGE("read array instance length: %d", arrLength);
 
         Object* obj = offIdToObject(objId);
         if(obj == NULL) {
@@ -297,14 +512,18 @@ void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
 
   u4 i, j;
   FifoBuffer fb = auxFifoCreate();
+  /* add static class reachable object into write queue */
+  dvmHashForeach(gDvm.loadedClasses, (HashForeachFunc)addClazzReachableObj, NULL);
 
   /* Send over stack information. */
   FifoBuffer sfb = auxFifoCreate();
   offPushAllStacks(&sfb);
 
   /* Send over new class status updates. */
+  ALOGE("gDvm.offStatusUpdate size is: %u", auxVectorSize(&gDvm.offStatusUpdate));
   for(j = 0; j < auxVectorSize(&gDvm.offStatusUpdate); j++) {
     ClassObject* clazz = (ClassObject*)auxVectorGet(&gDvm.offStatusUpdate, j).l;
+    //ALOGE("offloading send: clazz id: %d, clazz name: %s", clazz->objId, clazz->descriptor);
 
     JValue valobj; valobj.l = clazz;
     writeValue(&fb, 'L', &valobj);
@@ -316,9 +535,15 @@ void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
   writeValue(&fb, 'L', &valobj);
 
   u4 dirty_fields = 0;
+  ALOGE("gDvm.offWriteQueue size is: %u", auxVectorSize(&gDvm.offWriteQueue));
   for(i = 0; i < auxVectorSize(&gDvm.offWriteQueue); i++) {
     Object* obj = auxVectorGet(&gDvm.offWriteQueue, i).l; assert(obj);
     ObjectInfo* info = offIdObjectInfo(obj->objId); assert(info);
+    if(!gDvm.isServer && !isObjectDirty(info)) {
+      //ALOGE("offloading send: object id: %d, object is not dirty, clazz is: %s", obj->objId, obj->clazz->descriptor);
+      continue;
+    }
+    //ALOGE("offloading send: object id: %d", obj->objId);
 
     /* Write the object definition. */
     JValue valobj; valobj.l = obj;
@@ -326,22 +551,42 @@ void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
 
     /* Write the dirty bits. */
     u4 maxIndex = getMaxFieldIndex(obj);
-    writeU4(&fb, info->dirty);
-    if(maxIndex > 32) {
-      u4 bsz = (maxIndex - 1) >> 5;
-      for(j = 0; j < bsz; j++) info->bits[j] = htonl(info->bits[j]);
-      auxFifoPushData(&fb, (char*)info->bits, bsz << 2);
-      for(j = 0; j < bsz; j++) info->bits[j] = ntohl(info->bits[j]);
+    if(gDvm.isServer || info->allFlag) {
+      writeU4(&fb, info->dirty);
+      ALOGE("offloading send: object id: %d, dirty: %u, in allFlag", obj->objId, info->dirty);
+      if(maxIndex > 32) {
+        u4 bsz = (maxIndex - 1) >> 5;
+        for(j = 0; j < bsz; j++) info->bits[j] = htonl(info->bits[j]);
+        auxFifoPushData(&fb, (char*)info->bits, bsz << 2);
+        for(j = 0; j < bsz; j++) {
+          info->bits[j] = ntohl(info->bits[j]);
+          ALOGE("offloading send: object id: %d, dirty bits j: %d, value: %u", obj->objId, j, info->bits[j]);
+        }
+      }
+    } else {
+      writeU4(&fb, info->dirty & info->migrate);
+      ALOGE("offloading send: object id: %d, dirty: %u", obj->objId, info->dirty & info->migrate);
+      if(maxIndex > 32) {
+        u4 bsz = (maxIndex - 1) >> 5;
+        for(j = 0; j < bsz; j++) {
+          writeU4(&fb, info->bits[j] & info->highbits[j]);
+          ALOGE("offloading send: object id: %d, dirty bits j: %d, value: %u", obj->objId, j, info->bits[j] & info->highbits[j]);
+        }
+      }
     }
 
     if(isClassObject(obj)) {
       /* To sync class objects we just write out all of its globals. */
       ClassObject* clazz = (ClassObject*)obj;
+      //ALOGE("offloading send: class id: %d, descriptor: %s", obj->objId, clazz->descriptor);
 
       StaticField* fld = clazz->sfields;
       StaticField* efld = fld + clazz->sfieldCount;
       for(; fld != efld; ++fld) {
-        if(isFieldDirty(info, fld - clazz->sfields)) {
+        if(gDvm.isServer && isFieldDirty(info, fld - clazz->sfields)) {
+          writeValue(&fb, *fld->signature, (JValue*)&fld->value);
+          dirty_fields++;
+        } else if(!gDvm.isServer && isFieldDirty(info, fld - clazz->sfields) && isFieldMigrate(info, fld - clazz->sfields)) {
           writeValue(&fb, *fld->signature, (JValue*)&fld->value);
           dirty_fields++;
         }
@@ -352,22 +597,32 @@ void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
         /* For array objects we send the whole array contents for now. */
         ArrayObject* aobj = (ArrayObject*)obj;
         char* contents = (char*)aobj->contents;
+        //ALOGE("offloading send: array id: %d, descriptor: %s", obj->objId, aobj->clazz->descriptor);
 
         u4 typeWidth = auxTypeWidth(aobj->clazz->descriptor[1]);
         for(j = 0; j < aobj->length; j++, contents += typeWidth) {
-          if(isFieldDirty(info, j)) {
+          if(gDvm.isServer && isFieldDirty(info, j)) {
+            writeValue(&fb, aobj->clazz->descriptor[1], (JValue*)contents);
+            dirty_fields++;
+          } else if(!gDvm.isServer && isFieldDirty(info, j) && isFieldMigrate(info, j)) {
             writeValue(&fb, aobj->clazz->descriptor[1], (JValue*)contents);
             dirty_fields++;
           }
         }
       } else {
         /* For normal class objects we write out all the instance fields. */
+        //ALOGE("offloading send: object instance id: %d, descriptor: %s", obj->objId, obj->clazz->descriptor);
         for(; clazz; clazz = clazz->super) {
           InstField* fld = clazz->ifields;
           InstField* efld = fld + clazz->ifieldCount;
           for(; fld != efld; ++fld) {
-            if(isFieldDirty(info,
+            if(gDvm.isServer && isFieldDirty(info,
                (fld->byteOffset - sizeof(Object)) >> 2)) {
+              writeValue(&fb, *fld->signature,
+                         (JValue*)(((char*)obj) + fld->byteOffset));
+              dirty_fields++;
+            } else if(!gDvm.isServer && isFieldDirty(info, (fld->byteOffset - sizeof(Object)) >> 2) 
+                       && isFieldMigrate(info, (fld->byteOffset - sizeof(Object)) >> 2)) {
               writeValue(&fb, *fld->signature,
                          (JValue*)(((char*)obj) + fld->byteOffset));
               dirty_fields++;
@@ -388,9 +643,27 @@ void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
     info->isQueued = false;
 
     u4 maxIndex = getMaxFieldIndex(obj);
-    info->dirty = 0;
-    if(maxIndex > 32) {
-      memset(info->bits, 0, ((maxIndex - 1) >> 5) << 2);
+    if(gDvm.isServer || info->allFlag) {
+      info->dirty = 0;
+      if(maxIndex > 32) {
+        memset(info->bits, 0, ((maxIndex - 1) >> 5) << 2);
+      }
+    } else {
+      info->dirty = info->dirty & ~info->migrate;
+      if(maxIndex > 32) {
+        u4 bsz = (maxIndex - 1) >> 5;
+        for(j = 0; j < bsz; j++) {
+          info->bits[j] = info->bits[j] & ~info->highbits[j];
+        }
+      }
+    }
+    if(!gDvm.isServer) {
+      info->allFlag = false;
+      info->migrate = 0x00000000U;
+      if(info->highbits != NULL) {
+        free(info->highbits);
+        info->highbits = NULL;
+      }
     }
   }
   auxVectorResize(&gDvm.offWriteQueue, 0);
@@ -513,13 +786,11 @@ bool offSyncPullDo(void(*before_func)(void*), void* before_arg,
     JValue valobj; readValue(self, &fb, 'L', &valobj, false);
     ClassObject* clazz = (ClassObject*)valobj.l;
     if(clazz == NULL) break;
+    //ALOGE("offloading receive: clazz id: %d, clazz name: %s", clazz->objId, clazz->descriptor);
 
     if(clazz->status < CLASS_INITIALIZING) {
       /* We need to make sure that this class gets linked together and our
        * important register maps get created. */
-      if (strncmp(clazz->descriptor, "Ledu/utk/offloadtest", 20) == 0) {
-        ALOGE("doing dry init for class: %s. gDvm.generateRegisterMaps: %d", clazz->descriptor, gDvm.generateRegisterMaps);
-      }
       dvmDryInitClass(clazz);
     }
     clazz->status = (ClassStatus)readU4(&fb);
@@ -535,10 +806,12 @@ bool offSyncPullDo(void(*before_func)(void*), void* before_arg,
     Object* obj = valobj.l;
     if(obj == NULL) break;
     ObjectInfo* info = offIdObjectInfo(obj->objId);
+    //ALOGE("offloading receive: object id: %d, addr: %p", obj->objId, obj);
 
     /* Read in the dirty bits. */
     u4 maxIndex = getMaxFieldIndex(obj);
     u4 dirty = readU4(&fb);
+    ALOGE("offloading receive: object id: %d, dirty: %u", obj->objId, info->dirty);
     if(maxIndex > 32) {
       u4 bsz = (maxIndex - 1) >> 5;
       if(bsz > bitsSz) {
@@ -546,11 +819,15 @@ bool offSyncPullDo(void(*before_func)(void*), void* before_arg,
         bitsSz = bsz;
       }
       auxFifoReadBuffer(&fb, (char*)bits, bsz << 2);
-      for(j = 0; j < bsz; j++) bits[j] = ntohl(bits[j]);
+      for(j = 0; j < bsz; j++) {
+        bits[j] = ntohl(bits[j]);
+        ALOGE("offloading receive: object id: %d, dirty bits j: %d, value: %u", obj->objId, j, bits[j]);
+      }
     }
 
     if(isClassObject(obj)) {
       ClassObject* clazz = (ClassObject*)obj;
+      //ALOGE("offloading receive: class id: %d, descriptor: %s", obj->objId, clazz->descriptor);
 
       StaticField* fld = clazz->sfields;
       StaticField* efld = fld + clazz->sfieldCount;
@@ -567,6 +844,7 @@ bool offSyncPullDo(void(*before_func)(void*), void* before_arg,
       if(*clazz->descriptor == '[') {
         ArrayObject* aobj = (ArrayObject*)obj;
         char* contents = (char*)aobj->contents;
+        //ALOGE("offloading receive: array id: %d, descriptor: %s", obj->objId, aobj->clazz->descriptor);
 
         u4 typeWidth = auxTypeWidth(clazz->descriptor[1]);
         for(j = 0; j < aobj->length; j++, contents += typeWidth) {
@@ -578,6 +856,7 @@ bool offSyncPullDo(void(*before_func)(void*), void* before_arg,
           }
         }
       } else {
+        //ALOGE("offloading receive: object instance id: %d, descriptor: %s", obj->objId, obj->clazz->descriptor);
         for(; clazz; clazz = clazz->super) {
           InstField* fld = clazz->ifields;
           InstField* efld = fld + clazz->ifieldCount;
