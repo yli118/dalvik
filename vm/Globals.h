@@ -41,6 +41,12 @@ struct GcHeap;
 struct BreakpointSet;
 struct InlineSub;
 
+struct charscomp {
+    bool operator() (const char* lhs, const char* rhs) const {
+        return strcmp(lhs, rhs) < 0;
+    }
+};
+
 /*
  * One of these for each -ea/-da/-esa/-dsa on the command line.
  */
@@ -746,7 +752,7 @@ struct DvmGlobals {
     int offNetPipe[2];
     
     // Modified by Yong map which stores the method access information
-    std::map<char*, MethodAccResult*> methodAccMap;
+    std::map<char*, MethodAccResult*, charscomp>* methodAccMap;
 
     // offload/Comm.h
     u4 nextId;

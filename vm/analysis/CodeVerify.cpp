@@ -3460,9 +3460,6 @@ static void verifyPrep()
  */
 bool dvmVerifyCodeFlow(VerifierData* vdata)
 {
-    if (strncmp(vdata->method->clazz->descriptor, "Ledu/utk/offloadtest", 20) == 0) {
-        ALOGE("verify code flow for method: %s, generateRegisterMap: %d", vdata->method->name, gDvm.generateRegisterMaps);
-    }
     bool result = false;
     const Method* meth = vdata->method;
     const int insnsSize = vdata->insnsSize;
@@ -3543,7 +3540,6 @@ bool dvmVerifyCodeFlow(VerifierData* vdata)
      * Generate a register map.
      */
     if (generateRegisterMap) {
-        ALOGE("generate register map please");
         RegisterMap* pMap = dvmGenerateRegisterMapV(vdata);
         if (pMap != NULL) {
             /*

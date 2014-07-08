@@ -234,9 +234,6 @@ static bool scanTryCatchBlocks(const Method* meth, InsnFlags* insnFlags)
  */
 static bool verifyMethod(Method* meth)
 {
-    if (strncmp(meth->clazz->descriptor, "Ledu/utk/offloadtest", 20) == 0) {
-        ALOGE("verify method: %s, generateRegisterMap: %d", meth->name, gDvm.generateRegisterMaps);
-    }
     bool result = false;
 
     /*
