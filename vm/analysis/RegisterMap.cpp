@@ -606,10 +606,7 @@ static size_t computeRegisterMapSize(const RegisterMap* pMap)
  * direct-mapped maps are correctly identified as such.
  */
 static bool writeMapForMethod(const Method* meth, u1** pPtr)
-{         
-    if (strncmp(meth->clazz->descriptor, "Ledu/utk/offloadtest", 20) == 0) {
-        ALOGE("writeMapForMethod for method: %s", "aa");
-      }
+{
     if (meth->registerMap == NULL) {
         if (!dvmIsAbstractMethod(meth) && !dvmIsNativeMethod(meth)) {
             ALOGW("Warning: no map available for %s.%s",
