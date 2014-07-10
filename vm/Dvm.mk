@@ -340,7 +340,8 @@ ifeq ($(dvm_offload),true)
       offload/Stack.cpp \
       offload/CustomizedClass.cpp \
       offload/MethodParser.cpp \
-      offload/UnoptDexLoader.cpp
+      offload/UnoptDexLoader.cpp \
+      offload/GlobalAnalysis.cpp
 endif
 
 ifeq ($(dvm_tracer),true)

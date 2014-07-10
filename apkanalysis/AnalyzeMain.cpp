@@ -177,7 +177,6 @@ static Thread* allocThread(int interpStackSize)
 static size_t classObjectSize(size_t sfieldCount)
 {
     size_t offset = OFFSETOF_MEMBER(ClassObject, sfields);
-    ALOGE("initial offset is: %u, size is: %u", offset, offset + sizeof(StaticField) * sfieldCount);
     return offset + sizeof(StaticField) * sfieldCount;
 }
 
@@ -294,8 +293,8 @@ static bool createInitialClasses() {
 }
 
 int main(int argc, char** argv) {
-    if(argc != 2) {
-        printf("apkanalysis [ApkPath]]\n");
+    if(argc != 2 && argc != 3) {
+        printf("apkanalysis -option [ApkPath]]\n");
         return 0;
     }
     /* allocate a TLS slot */
@@ -405,7 +404,12 @@ int main(int argc, char** argv) {
     offControlStartup(false);
     dvmInstanceofStartup();
     
-    char* apkPath = argv[1];
-    loadApk(apkPath);
+    if(strcmp(argv[1], "-s")) {
+        char* apkPath = argv[1];
+        loadApk(apkPath);
+    } else {
+        char* apkPath = argv[2];
+        loadApkStatic(apkPath);
+    }
     printf("apk analysis complete");
 }

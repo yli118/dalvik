@@ -460,11 +460,6 @@ void offTransmitMonitors(Thread* thread, FifoBuffer* fb) {
     assert(LW_MONITOR(lod->obj->lock)->lockCount == lod->recursionCount);
 
     offAddTrackedObject(lod->obj);
-    // Modified by Yong, if it is not server, we only migrate the most basic information
-    if(!gDvm.isServer) {
-        //ObjectInfo* info = offIdObjectInfo(auxObjectToId(lod->obj));
-        //info->migrate = 0x0000000FU;
-    }
     writeU4(fb, auxObjectToId(lod->obj));
     writeU4(fb, lod->recursionCount);
     writeU4(fb, offGetLocalWaiters(lod->obj));

@@ -16,7 +16,7 @@ struct ArrayObject;
 struct ClassObject;
 struct InstField;
 struct StaticField;
-struct ObjectAccResult;
+//struct ObjectAccResult;
 
 typedef struct ObjectInfo {
   /* The pointer to the Object. */
@@ -42,11 +42,9 @@ typedef struct ObjectInfo {
   
   // flag indicates that all the attribute of the object should be marked as accessed to assure correctness
   bool allFlag;
-  
-  //u4 nouse;
 
   // recursively indicates the fields of the object
-  ObjectAccResult* objAccInfo;
+  //ObjectAccResult* objAccInfo;
    
   /* Tracks the neccessity of migrating low field indexes. */
   u4 migrate;
@@ -63,6 +61,9 @@ struct ObjectInfo* offIdObjectInfo(u4 objId);
 
 /* Add tracked object to the offload engine. */
 void offAddTrackedObject(struct Object* obj);
+
+/* Add an object into track and handle its fields recursively */
+void offAddObjectIntoTrack(struct Object* objToAdd, struct ObjectAccResult* objAccInfoToAdd);
 
 /* Register the proxy class. */
 void offRegisterProxy(struct ClassObject* clazz, char* str,

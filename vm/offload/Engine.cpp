@@ -31,6 +31,7 @@ void offJumpIntoInterp(Thread* self) {
   const StackSaveArea* saveArea = SAVEAREA_FROM_FP(sst->curFrame);
   sst->method = saveArea->method;
   sst->pc = saveArea->xtra.currentPc;
+  //ALOGE("start method execution, where pc is %p, method starts is: %p", sst->pc, sst->method->insns);
 
   if(sst->method->clazz->status < CLASS_INITIALIZING ||
      sst->method->clazz->status == CLASS_ERROR) {
@@ -68,7 +69,7 @@ ALOGI("THREAD %d: RECEIVE OWNERSHIP OF %d", self->threadId, objId);
 static bool activate(Thread* self) {
   bool res = offSyncPullDo(NULL, NULL,
                            (void(*)(void*, FifoBuffer*))doActivate, self);
-  offSchedulerUnsafePoint(self);
+//  offSchedulerUnsafePoint(self);
   return res;
 }
 
@@ -109,46 +110,19 @@ void offMigrateThread(Thread* self) {
   if(!offRecoveryCheckEnterHazard(self)) return;
 
   ALOGI("Migrating thread %d", self->threadId);
-  /*
+  
     // print stack information
-  InterpSaveState* sst = &self->interpSave;
+  /*InterpSaveState* sst = &self->interpSave;
   u4* fp = sst->curFrame;
-   while(fp != NULL) {
+  while(fp != NULL) {
     const StackSaveArea* saveArea = SAVEAREA_FROM_FP(fp);
     Method* method = (Method*)saveArea->method;
     if(method != NULL) {
         ALOGE("running method: %s.%s", method->clazz->descriptor, method->name);
+    } else {
+        ALOGE("we get a break frame");
     }
     fp = saveArea->prevFrame;
-  }*/
-  
-  // analyze method intruction stream
-  /*InterpSaveState* sst = &self->interpSave;
-  u4* fp = sst->curFrame;
-  const StackSaveArea* saveArea = SAVEAREA_FROM_FP(fp);
-  Method* method = (Method*)saveArea->method;
-  DvmDex* methodClassDex;
-  methodClassDex = method->clazz->pDvmDex;
-  const u2* insns = method->insns;
-  u4 insnsSize = dvmGetMethodInsnsSize(method);
-  for (int i = 0; i < (int) insnsSize; ) {
-    size_t width = dexGetWidthFromInstruction(insns);
-    Opcode opcode = dexOpcodeFromCodeUnit(*insns);
-    if (opcode == OP_IGET || opcode == OP_IGET_WIDE || opcode == OP_IGET_OBJECT
-     || opcode == OP_IGET_BOOLEAN || opcode == OP_IGET_BYTE || opcode == OP_IGET_CHAR
-      || opcode == OP_IGET_SHORT) {
-        InstField* ifield;
-        Object* obj;
-        //u2 vsrc1, vsrc2, vdst;
-        //u2 vdst = *insns >> 8 & 0x0f;
-        u2 vsrc1 = *insns >> 12;
-        u4 ref = *(insns + 1);
-        obj = (Object*) fp[vsrc1];
-        ifield = (InstField*) dvmDexGetResolvedField(methodClassDex, ref); 
-        ALOGE("get iget code instruction, obj: %s, field: %s", obj->clazz->descriptor, ifield->name);
-    }
-    i += width;
-    insns += width;
   }*/
 
   self->offLocalOnly = false;
@@ -173,7 +147,7 @@ bool offPerformMigrate(Thread* self) {
   if(!activate(self)) return false;
   
   //print out the stacks
-  InterpSaveState* sst = &self->interpSave;
+  /*InterpSaveState* sst = &self->interpSave;
   u4* fp = sst->curFrame;
    while(fp != NULL) {
     const StackSaveArea* saveArea = SAVEAREA_FROM_FP(fp);
@@ -182,16 +156,19 @@ bool offPerformMigrate(Thread* self) {
         ALOGE("running method: %s.%s", method->clazz->descriptor, method->name);
     }
     fp = saveArea->prevFrame;
-  }
+  }*/
 
+  //ALOGE("after get the migrated data, the breaks are: %d and %d", self->breakFrames, originalBreaks);
   while(self->breakFrames > originalBreaks) {
     u4 newBreaks = self->breakFrames;
+    u4* offStackFpStop = self->offStackFpStop;
     offJumpIntoInterp(self);
     assert(self->breakFrames <= newBreaks);
     if(self->offFlagDeath) {
       return true;
     } else if(self->breakFrames == newBreaks) {
       self->offDeactivateBreakFrames = originalBreaks;
+      self->offStackFpStop = offStackFpStop;
       offWriteU1(self, OFF_ACTION_MIGRATE);
       deactivate(self);
       return false;
@@ -199,7 +176,7 @@ bool offPerformMigrate(Thread* self) {
   }
   
   // let it run somehow
-  offJumpIntoInterp(self);
+  //offJumpIntoInterp(self);
 
   ALOGI("COLLAPSING DOWN %d %d", self->breakFrames, originalBreaks);
   return true;

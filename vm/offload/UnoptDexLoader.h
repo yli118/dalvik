@@ -19,3 +19,4 @@
 #endif
 
 void loadApk(char* apkPath);
+ClassPathEntry* processClassPath(const char* pathStr);

@@ -4323,7 +4323,7 @@ bool dvmDryInitClass(ClassObject* clazz)
     if (clazz->status == CLASS_INITIALIZED) {
         return true;
     }
-
+    
     assert(dvmIsClassLinked(clazz) || clazz->status == CLASS_ERROR);
 
     /*
@@ -4531,7 +4531,7 @@ bool dvmInitClass(ClassObject* clazz) {
         clazz->initThreadId == self->threadId) {
         return true;
     }
-    /*if (!gDvm.initializing && gDvm.isServer) {
+    if (!gDvm.initializing && gDvm.isServer) {
         if (dvmFindDirectMethodByDescriptor(clazz, "<clinit>", "()V") != NULL) {
             InterpSaveState* sst = &self->interpSave;
             if (sst->curFrame == NULL ||
@@ -4541,11 +4541,12 @@ bool dvmInitClass(ClassObject* clazz) {
                       "guarantee failure recovery");
                 offMigrateClinit(self, clazz);
             } else while(clazz->status != CLASS_INITIALIZED) {
-                offMigrateThread(self);
+                ALOGE("migrate back from server at class initialize");
+                offMigrateClinit(self, clazz);
             }
             return clazz->status != CLASS_ERROR;
         }
-    }*/
+    }
 #endif
 
     dvmLockObject(self, (Object*) clazz);
@@ -4591,11 +4592,6 @@ bool dvmInitClass(ClassObject* clazz) {
     } else {
         LOGVV("Invoking %s.<clinit>", clazz->descriptor);
         JValue unused;
-#ifdef WITH_OFFLOAD
-        pthread_mutex_lock(&gDvm.offCommLock);
-        auxVectorPushL(&gDvm.offStatusUpdate, (Object*)clazz);
-        pthread_mutex_unlock(&gDvm.offCommLock);
-#endif
         dvmCallMethod(self, method, NULL, &unused);
     }
 
@@ -4612,10 +4608,20 @@ bool dvmInitClass(ClassObject* clazz) {
 
         dvmLockObject(self, (Object*) clazz);
         clazz->status = CLASS_ERROR;
+#ifdef WITH_OFFLOAD
+        pthread_mutex_lock(&gDvm.offCommLock);
+        auxVectorPushL(&gDvm.offStatusUpdate, (Object*)clazz);
+        pthread_mutex_unlock(&gDvm.offCommLock);
+#endif
     } else {
         /* success! */
         dvmLockObject(self, (Object*) clazz);
         clazz->status = CLASS_INITIALIZED;
+#ifdef WITH_OFFLOAD
+        pthread_mutex_lock(&gDvm.offCommLock);
+        auxVectorPushL(&gDvm.offStatusUpdate, (Object*)clazz);
+        pthread_mutex_unlock(&gDvm.offCommLock);
+#endif
         LOGVV("Initialized class: %s", clazz->descriptor);
 
 #ifdef WITH_OFFLOAD
@@ -4647,11 +4653,6 @@ bool dvmInitClass(ClassObject* clazz) {
     }
 
 bail_notify:
-#ifdef WITH_OFFLOAD
-    pthread_mutex_lock(&gDvm.offCommLock);
-    auxVectorPushL(&gDvm.offStatusUpdate, (Object*)clazz);
-    pthread_mutex_unlock(&gDvm.offCommLock);
-#endif
     /*
      * Notify anybody waiting on the object.
      */

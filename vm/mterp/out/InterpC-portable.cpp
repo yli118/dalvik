@@ -43,7 +43,6 @@
 # define CHECK_BRANCH_OFFSETS
 # define CHECK_REGISTER_INDICES
 #endif
-
 /*
  * Some architectures require 64-bit alignment for access to 64-bit data
  * types.  We can't just use pointers to copy 64-bit values out of our
@@ -440,7 +439,6 @@ static inline bool checkForNullExportPC(Object* obj, u4* fp, const u2* pc)
 
 #ifdef WITH_OFFLOAD
 #define CHECK_FOR_MIGRATE() do {                                            \
-        if (self->offFlagMigration) {                                       \
             EXPORT_PC();                                                    \
             u4 breakFrames = self->breakFrames;                             \
             self->offFlagMigration = false;                                 \
@@ -448,7 +446,7 @@ static inline bool checkForNullExportPC(Object* obj, u4* fp, const u2* pc)
             if (self->offFlagDeath || self->breakFrames < breakFrames) {    \
                 GOTO_bail();                                                \
             }                                                               \
-            ALOGE("continue to run after perform migrate at check_for_migrate");    \
+            ALOGI("continue to run after perform migrate at check_for_migrate");    \
             const StackSaveArea* saveArea = SAVEAREA_FROM_FP(self->interpSave.curFrame);\
             self->interpSave.method = curMethod = saveArea->method;         \
             fp = (u4*) self->interpSave.curFrame;                           \
@@ -458,9 +456,8 @@ static inline bool checkForNullExportPC(Object* obj, u4* fp, const u2* pc)
                 GOTO_exceptionThrown();                                     \
             }                                                               \
             FINISH(0);                                                      \
-        }                                                                   \
     } while(0)
-#define SCHEDULER_SAFE_POINT() offSchedulerSafePoint(self)
+#define SCHEDULER_SAFE_POINT() offSchedulerSafePoint(self, curMethod)
 #define CHECK_STACK_INTEGRITY_DO(x) do {                                    \
         u4 breakFrames = self->breakFrames;                                 \
         u4 migrationCounter = self->migrationCounter;                       \
@@ -1170,6 +1167,14 @@ void dvmInterpretPortable(Thread* self)
 #if defined(EASY_GDB)
     StackSaveArea* debugSaveArea = SAVEAREA_FROM_FP(self->interpSave.curFrame);
 #endif
+#if defined(WITH_OFFLOAD)
+    StackSaveArea* curSaveArea = SAVEAREA_FROM_FP(self->interpSave.curFrame);
+    if(!gDvm.isServer) {
+        curSaveArea->startTime = dvmGetRelativeTimeUsec();
+    } else {
+        curSaveArea->startTime = -1U;
+    }
+#endif
     DvmDex* methodClassDex;     // curMethod->clazz->pDvmDex
     JValue retval;
 
@@ -1218,25 +1223,15 @@ void dvmInterpretPortable(Thread* self)
         DUMP_REGS(curMethod, self->interpSave.curFrame, false);
     }
 #endif
-/*    if(gDvm.isServer) {
-        ALOGE("running into method: %s. class: %s. boolean is: %d", curMethod->name, curMethod->clazz->descriptor, (strncmp(curMethod->clazz->descriptor, "Ledu/utk/offloadtest", 20) == 0));
-    }*/
-    /*if (strncmp(curMethod->clazz->descriptor, "Ledu/utk/offloadtest", 20) == 0) {
-//        ALOGE("current running class: %s method: %s, prev: %s", curMethod->clazz->descriptor, curMethod->name, self->interpSave.prev->method->name);
-        // analyze method intruction stream
-      
-        if(!gDvm.isServer) {
-//            gDvm.outputFlag = true;
-            self->offFlagMigration = true;
+#if defined(WITH_OFFLOAD)
+    if(!gDvm.isServer) {
+        SCHEDULER_SAFE_POINT();
+        if (self->offFlagMigration) {
+            self->isMethodStart = true;
             CHECK_FOR_MIGRATE();
-            //offIdSync(self);
-            // print out current clazz's classloader id
-            //ALOGE("current running class loader: %s, id is:%d", curMethod->clazz->classLoader->clazz->descriptor, curMethod->clazz->classLoader->objId);
         }
-    }*/
-/*    if(gDvm.isServer) {
-        ALOGE("running into method22222: %s. class: %s. boolean is: %d", curMethod->name, curMethod->clazz->descriptor, (strncmp(curMethod->clazz->descriptor, "Ledu/utk/offloadtest", 20) == 0));
-    }*/
+    }
+#endif 
  
     FINISH(0);                  /* fetch and execute first instruction */
 
@@ -3667,9 +3662,21 @@ GOTO_TARGET(returnFromMethod)
         ILOGV("> retval=0x%llx (leaving %s.%s %s)",
             retval.j, curMethod->clazz->descriptor, curMethod->name,
             curMethod->shorty);
-        //DUMP_REGS(curMethod, fp);
-
+        
         saveArea = SAVEAREA_FROM_FP(fp);
+        
+#if defined(WITH_OFFLOAD)
+        u8 end = dvmGetRelativeTimeUsec();
+        if(!gDvm.offDisabled && end > saveArea->startTime) {
+            if(gDvm.methodExeTimeMap->find(curMethod) == gDvm.methodExeTimeMap->end()) {
+                (*gDvm.methodExeTimeMap)[curMethod] = end - saveArea->startTime;
+            } else {
+                if(end - saveArea->startTime > (*gDvm.methodExeTimeMap)[curMethod]) {
+                    (*gDvm.methodExeTimeMap)[curMethod] = (end - saveArea->startTime + 15 * (*gDvm.methodExeTimeMap)[curMethod]) / 16;
+                }
+            }
+        }
+#endif
 
 #ifdef EASY_GDB
         debugSaveArea = saveArea;
@@ -3678,6 +3685,28 @@ GOTO_TARGET(returnFromMethod)
         /* back up to previous frame and see if we hit a break */
         fp = (u4*)saveArea->prevFrame;
         assert(fp != NULL);
+        
+#if defined(WITH_OFFLOAD) && defined(CHECK_FOR_MIGRATE)
+        /* if it has reach the end of the offloading method, we migrate it back */
+        if(gDvm.isServer) {
+            if(fp == self->offStackFpStop) {
+                self->isMethodReturn = true;
+                if(INST_INST(inst) == OP_RETURN_VOID || INST_INST(inst) == OP_RETURN_VOID_BARRIER) {
+                    self->returnType = 'v';
+                } else {
+                    self->retReg = INST_AA(inst);
+                    if(INST_INST(inst) == OP_RETURN_WIDE) {
+                      self->returnType = 'w';
+                    }
+                }
+                /* Export pc on the old frame. */
+                saveArea->xtra.currentPc = pc;
+                self->offFlagMigration = true;
+                ALOGI("migrate from server at the end of method, with return type: %d, retreg: %d", self->returnType, self->retReg);
+                CHECK_FOR_MIGRATE();
+            }
+        }
+#endif
 
         /* Handle any special subMode requirements */
         if (self->interpBreak.ctl.subMode != 0) {
@@ -3708,7 +3737,7 @@ GOTO_TARGET(returnFromMethod)
             curMethod->name, curMethod->shorty);
 
 #ifdef WITH_OFFLOAD
-        offStackFramePopped(self);
+//        offStackFramePopped(self);
 #endif
         /* use FINISH on the caller's invoke instruction */
         //u2 invokeInstr = INST_INST(FETCH(0));
@@ -3771,6 +3800,11 @@ GOTO_TARGET(exceptionThrown)
             PC_FP_TO_SELF();
             dvmReportExceptionThrow(self, exception);
         }
+        
+        // Modified by Yong to debug
+        if(gDvm.isServer) {
+          dvmDumpThread(self, false);
+        }
 
         /*
          * We need to unroll to the catch block or the nearest "break"
@@ -3823,6 +3857,21 @@ GOTO_TARGET(exceptionThrown)
 #endif
             dvmSetException(self, exception);
             dvmReleaseTrackedAlloc(exception, self);
+
+#if defined(WITH_OFFLOAD) && defined(CHECK_FOR_MIGRATE)
+        /* if it has reach the end of the offloading method, we migrate it back */
+        if(gDvm.isServer) {
+            if(catchRelPc < 0) {
+                /* Export pc on the old frame. */
+                StackSaveArea* saveArea;
+                saveArea = SAVEAREA_FROM_FP(fp);
+                saveArea->xtra.currentPc = pc;
+                self->offFlagMigration = true;
+                ALOGI("migrate from server at exception which cannot be caught");
+                CHECK_FOR_MIGRATE();
+            }
+        }
+#endif
             GOTO_bail();
         }
 
@@ -3974,22 +4023,22 @@ GOTO_TARGET(invokeMethod, bool methodCallRange, const Method* _methodToCall,
         newSaveArea = SAVEAREA_FROM_FP(newFp);
 
 #if defined(WITH_OFFLOAD) && defined(CHECK_FOR_MIGRATE)
-/*        if (gDvm.isServer && !gDvm.initializing &&
+        if (gDvm.isServer && !gDvm.initializing &&
               dvmIsNativeMethod(methodToCall) &&
               (~methodToCall->accessFlags & ACC_OFFLOADABLE)) {
             self->offFlagMigration = true;
-            ALOGE("migrate from server at native method");
+            ALOGI("migrate from server at native method");
             CHECK_FOR_MIGRATE();
             dvmAbort();
-        } else if(gDvm.isServer && methodToCall == gDvm.offMethWriteImpl) {*/
+        } else if(gDvm.isServer && methodToCall == gDvm.offMethWriteImpl) {
             /* We allow writing to stdout/stderr on the server. */
-/*            if (newFp[1] != 1 && newFp[1] != 2) {
+            if (newFp[1] != 1 && newFp[1] != 2) {
                 self->offFlagMigration = true;
-                ALOGE("migrate from server at writing");
+                ALOGI("migrate from server at writing");
                 CHECK_FOR_MIGRATE();
                 dvmAbort();
             }
-        }*/
+        }
 #endif
 
         /* verify that we have enough space */
@@ -4032,6 +4081,13 @@ GOTO_TARGET(invokeMethod, bool methodCallRange, const Method* _methodToCall,
         newSaveArea->returnAddr = 0;
 #endif
         newSaveArea->method = methodToCall;
+#if defined(WITH_OFFLOAD)
+        if(!gDvm.isServer) {
+            newSaveArea->startTime = dvmGetRelativeTimeUsec();
+        } else {
+            newSaveArea->startTime = -1U;
+        }
+#endif
 
         if (self->interpBreak.ctl.subMode != 0) {
             /*
@@ -4061,66 +4117,42 @@ GOTO_TARGET(invokeMethod, bool methodCallRange, const Method* _methodToCall,
             ILOGD("> pc <-- %s.%s %s", curMethod->clazz->descriptor,
                 curMethod->name, curMethod->shorty);
             DUMP_REGS(curMethod, fp, true);         // show input args
-            if (strncmp(curMethod->clazz->descriptor, "Ledu/utk/offloadtest", 20) == 0) {
-        ALOGE("current running class: %s method: %s, prev: %s", curMethod->clazz->descriptor, curMethod->name, self->interpSave.prev->method->name);
-        if(strncmp(curMethod->name, "matrixTest", 10) == 0) {
-            //findSubClass(curMethod->clazz, curMethod->clazz->classLoader);
-            //loadApk();
-            //parseMethod(curMethod);
-        }
-        /*const u2* insns = curMethod->insns;
-      u4 insnsSize = dvmGetMethodInsnsSize(curMethod);
-      int count = 0;
-      for (int i = 0; i < (int) insnsSize; ) {
-        size_t width = dexGetWidthFromInstruction(insns);
-        Opcode opcode = dexOpcodeFromCodeUnit(*insns);
-        if (opcode == OP_IGET || opcode == OP_IGET_WIDE || opcode == OP_IGET_OBJECT
-         || opcode == OP_IGET_BOOLEAN || opcode == OP_IGET_BYTE || opcode == OP_IGET_CHAR
-          || opcode == OP_IGET_SHORT || opcode == OP_IGET_OBJECT_VOLATILE || opcode == OP_IGET_WIDE_VOLATILE) {
-          ALOGE("opcode iteration: %d", count++);
-            //u2 vdst = *insns >> 8 & 0x0f;
-            Object* obj;
-            vsrc1 = *insns >> 12;
-            obj = (Object*) fp[vsrc1];
-            InstField* ifield;
-            ref = insns[1];
-            ALOGE("opcode ref is: %d", ref);
-            ifield = (InstField*) dvmDexGetResolvedField(methodClassDex, ref); 
-            //ALOGE("opcode iget code instruction, obj: %s, field: %s", obj->clazz->descriptor, ifield->name);
-            if (ifield == NULL) {
-                ALOGE("opcode ifield is null");          
-                ifield = dvmResolveInstField(curMethod->clazz, ref);
-                if (ifield == NULL) {          
-                    ALOGE("opcode ifield is still null");
+
+#if defined(WITH_OFFLOAD)        
+            if(!gDvm.isServer) {
+                SCHEDULER_SAFE_POINT();
+                if (self->offFlagMigration) {
+                    self->isMethodStart = true;
+                    CHECK_FOR_MIGRATE();
                 }
             }
-            ALOGE("opcode iget code instruction, field: %s", ifield->name);
-        } else if (opcode == OP_IGET_QUICK || opcode == OP_IGET_WIDE_QUICK
-          || opcode == OP_IGET_OBJECT_QUICK) {
-            ALOGE("opcode iteration: %d", count++);
-            //u2 vdst = *insns >> 8 & 0x0f;
-            Object* obj;
-            vsrc1 = *insns >> 12;
-            obj = (Object*) fp[vsrc1];
-            //InstField* ifield;
-            ref = insns[1];
-            ALOGE("opcode ref is: %d", ref);
-            ALOGE("opcode get value is: %d",  ((JValue*)BYTE_OFFSET(obj, (int) ref)) -> i);
-        }
-        i += width;
-        insns += width;*/
- /*       if(!gDvm.isServer) {
-//            gDvm.outputFlag = true;
-            self->offFlagMigration = true;
-            CHECK_FOR_MIGRATE();
-            //offIdSync(self);
-            // print out current clazz's classloader id
-            //ALOGE("current running class loader: %s, id is:%d", curMethod->clazz->classLoader->clazz->descriptor, curMethod->clazz->classLoader->objId);
-        }
-      }*/
-    }
+#endif            
+            
             FINISH(0);                              // jump to method start
         } else {
+#if defined(WITH_OFFLOAD)
+        // set the execution time for each method between these two break frame
+        if (!gDvm.offDisabled && !gDvm.isServer &&
+              ((~methodToCall->accessFlags & ACC_OFFLOADABLE) || methodToCall == gDvm.offMethWriteImpl)) {
+            u4* tempFp = fp;
+            u8 end = dvmGetRelativeTimeUsec();
+            while(tempFp != NULL && !dvmIsBreakFrame(tempFp)) {
+                StackSaveArea* tempArea = SAVEAREA_FROM_FP(tempFp);
+                if(end > tempArea->startTime) {
+                    if(gDvm.methodExeTimeMap->find(tempArea->method) == gDvm.methodExeTimeMap->end()) {
+                        (*gDvm.methodExeTimeMap)[tempArea->method] = end - tempArea->startTime;
+                    } else {
+                        if(end - tempArea->startTime > (*gDvm.methodExeTimeMap)[tempArea->method]) {
+                            (*gDvm.methodExeTimeMap)[tempArea->method] = (end - tempArea->startTime + 15 * (*gDvm.methodExeTimeMap)[tempArea->method]) / 16;
+                        }
+                    }
+                    tempArea->startTime = -1U;
+                }
+                tempFp = tempArea->prevFrame;
+            }
+        }
+#endif  
+        
             /* set this up for JNI locals, even if not a JNI native */
             newSaveArea->xtra.localRefCookie = self->jniLocalRefTable.segmentState.all;
 
@@ -4150,7 +4182,7 @@ GOTO_TARGET(invokeMethod, bool methodCallRange, const Method* _methodToCall,
             dvmPopJniLocals(self, newSaveArea);
             self->interpSave.curFrame = fp;
 #ifdef WITH_OFFLOAD
-            offStackFramePopped(self);
+//            offStackFramePopped(self);
 #endif
 
             /*

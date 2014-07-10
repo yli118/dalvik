@@ -3,7 +3,7 @@
 #include "CustomizedClass.h"
 #include "libdex/DexCatch.h"
 
-int MaxBranchDepth = 10;
+int MaxBranchDepth = 8;
 unsigned int MaxSubCount = 15;
 
 extern std::vector<DvmDex*> loadedDex;
@@ -14,9 +14,12 @@ std::vector<ObjectAccInfo*>* returnInterests;
 std::map<Method*, MethodAccInfo*> methodResMap;
 std::map<Method*, MethodAccInfo*> virtualResMap;
 std::map<Method*, MethodAccInfo*> interResMap;
+std::map<Method*, std::map<ClassObject*, BitsVec*>* > methodStaticMap;
+std::map<ClassObject*, std::vector<ClassObject*>* > subclassMap;
+std::map<ClassObject*, std::vector<ClassObject*>* > implclassMap;
 
 // method declaration
-void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Method*>* chain, std::vector<int>* insOffsets, std::map<u2, std::vector<ObjectAccInfo*> >* interestRegObjMap, int depth, bool* exitMethod);
+void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>* chain, std::vector<int>* insOffsets, std::map<u2, std::vector<ObjectAccInfo*> >* interestRegObjMap, int depth, bool* exitMethod);
 
 u2 inst_a(const u2* insns) {
     return (*insns >> 8) & 0x0f;
@@ -400,7 +403,7 @@ void flagObjALLArrayImpl(ObjectAccInfo* objAccInfo, std::set<ObjectAccInfo*>* ch
             continue;
         }
         for(unsigned int j = 0; j < objAccInfo->trackSet[i]->size(); j++) {
-            flagObjALLImpl(objAccInfo->trackSet[i]->at(j), chain);
+            flagObjALLArrayImpl(objAccInfo->trackSet[i]->at(j), chain);
         }
     }
     chain->erase(objAccInfo);
@@ -572,15 +575,12 @@ void unionMethodAccInfo(MethodAccInfo* dstAccInfo, MethodAccInfo* srcAccInfo) {
 
 void mergeObjectAccFieldInfo(std::vector<ObjectAccInfo*>* dstAccInfoList, ObjectAccInfo* srcAccInfo, std::map<ObjectAccInfo*, std::vector<ObjectAccInfo*> >* addrMap) {
     (*addrMap)[srcAccInfo] = *dstAccInfoList;
-    if(srcAccInfo->allFlag) {
-        for(unsigned int i = 0; i < dstAccInfoList->size(); i++) {
-            dstAccInfoList->at(i)->allFlag = true;
-        }
-    }
     if(srcAccInfo->inArray) {
-        for(unsigned int i = 0; i < dstAccInfoList->size(); i++) {
-            dstAccInfoList->at(i)->inArray = true;
-        }
+        flagVecAllArray(dstAccInfoList);
+    } else {
+        if(srcAccInfo->allFlag) {
+            flagVecAll(dstAccInfoList);
+        }    
     }
     for(unsigned int i = 0; i < dstAccInfoList->size(); i++) {
         if(dstAccInfoList->at(i)->fieldSet.size() < srcAccInfo->fieldSet.size()) {
@@ -942,7 +942,7 @@ void mergeRangeMethodArgs(u2 vsrc1, u2 vdst, std::map<u2, std::vector<ObjectAccI
     
 }*/
 
-void handleCatchBranch(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Method*>* chain, std::vector<int>* insOffsets, std::map<u2, std::vector<ObjectAccInfo*> >* interestRegObjMap, int depth, bool* exitMethod) {
+void handleCatchBranch(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>* chain, std::vector<int>* insOffsets, std::map<u2, std::vector<ObjectAccInfo*> >* interestRegObjMap, int depth, bool* exitMethod) {
     Method* method = methodAccInfo->method;
     int relPc = insns - method->insns;
     const DexCode* pCode = dvmGetMethodCode(method);
@@ -972,7 +972,7 @@ void handleCatchBranch(const u2* insns, MethodAccInfo* methodAccInfo, std::vecto
                 std::map<u2, std::vector<ObjectAccInfo*> > tempInterest = *interestRegObjMap;
                 int newDepth = depth + 1;
                 // If we reach the maximum branch depth, we exit the parse of the method to save the cost of parse
-                if(newDepth == MaxBranchDepth) {
+                if(newDepth >= MaxBranchDepth) {
                     for(unsigned int i = 0; i < methodAccInfo->args->size(); i++) {
                         flagObjAll(methodAccInfo->args->at(i));
                     }
@@ -985,7 +985,216 @@ void handleCatchBranch(const u2* insns, MethodAccInfo* methodAccInfo, std::vecto
     }
 }
 
-void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Method*>* chain, std::vector<int>* insOffsets, std::map<u2, std::vector<ObjectAccInfo*> >* interestRegObjMap, int depth, bool* exitMethod) {
+void scanStatic(Method* method, MethodAccInfo* methodAccInfo, std::map<ClassObject*, BitsVec*>* caller, std::set<Method*>* chain) {
+    if(chain->find(method) != chain->end()) {
+        return;
+    }
+    chain->insert(method);
+    std::map<ClassObject*, BitsVec*>* clazzAccMap;
+    if(methodStaticMap.find(method) != methodStaticMap.end()) {
+        clazzAccMap = methodStaticMap[method];
+    } else {
+        clazzAccMap = new std::map<ClassObject*, BitsVec*>();
+        DvmDex* methodClassDex = method->clazz->pDvmDex;
+        const u2* insns = method->insns;
+        int width;
+        u4 ref;
+        Opcode opcode;
+        u4 insnsSize = dvmGetMethodInsnsSize(method);
+        for( ; insnsSize > 0; insns += width, insnsSize -= width) {
+            width = dexGetWidthFromInstruction(insns);
+            opcode = dexOpcodeFromCodeUnit(*insns);
+            if(opcode == OP_SGET_VOLATILE || opcode == OP_SGET_WIDE_VOLATILE || opcode == OP_SGET_OBJECT_VOLATILE
+            || opcode == OP_SGET || opcode == OP_SGET_WIDE || opcode == OP_SGET_OBJECT || opcode == OP_SGET_BOOLEAN
+            || opcode == OP_SGET_BYTE || opcode == OP_SGET_CHAR || opcode == OP_SGET_SHORT) {
+                ref = insns[1];
+                StaticField* sfield = (StaticField*)dvmDexGetResolvedField(methodClassDex, ref);
+                if (sfield == NULL) {
+                    sfield = resolveStaticField(method->clazz, ref);
+                    if(sfield == NULL) { // we should have encountered a wrong version field branch
+                        return;
+                    }
+                }
+                unsigned int offset = sfield - sfield->clazz->sfields;
+                if(clazzAccMap->find(sfield->clazz) == clazzAccMap->end()) {
+                    (*clazzAccMap)[sfield->clazz] = new BitsVec();
+                }
+                BitsVec* bitsvec = (*clazzAccMap)[sfield->clazz];
+                u4 sz = (offset >> 5) + 1;
+                if(bitsvec->size < offset || (bitsvec->size == offset && offset == 0)) {
+                    u4* newbits = (u4*)calloc(sz, 4);
+                    if(bitsvec->bits != NULL) {
+                        memcpy(newbits, bitsvec->bits, ((bitsvec->size >> 5) + 1) << 2);
+                        free(bitsvec->bits);
+                    }
+                    bitsvec->bits = newbits;
+                    bitsvec->size = offset;
+                }
+                bitsvec->bits[sz - 1] = bitsvec->bits[sz - 1] | (1U << (offset & 0x1F));
+            } else if(opcode == OP_INVOKE_VIRTUAL || opcode == OP_INVOKE_VIRTUAL_RANGE) {
+                ref = insns[1];             // method ref
+            
+                int voffset;
+                Method* baseMethod;
+                baseMethod = dvmDexGetResolvedMethod(methodClassDex, ref);
+                if (baseMethod == NULL) {
+                    baseMethod = resolveMethod(method->clazz, ref, METHOD_VIRTUAL);
+                    if(baseMethod == NULL) { // we should have encountered a wrong version method branch
+                        return;
+                    }
+                }
+                bool isLangObjectClass = baseMethod->clazz == javaLangObject;
+                if(isLangObjectClass) {
+                    continue;
+                }
+                voffset = baseMethod->methodIndex;
+                std::vector<ClassObject*>* subclasses = findSubClass(baseMethod->clazz);
+                std::set<Method*> parsedMethod;
+                
+                for(unsigned int idx = 0; idx < subclasses->size(); idx++) {
+                    Method* methodToCall = subclasses->at(idx)->vtable[voffset];
+                    assert(methodToCall != NULL);
+                    if(parsedMethod.find(methodToCall) != parsedMethod.end()) {
+                        continue;
+                    } else {
+                        parsedMethod.insert(methodToCall);
+                    }
+                    scanStatic(methodToCall, methodAccInfo, clazzAccMap, chain);
+                }
+            } else if(opcode == OP_INVOKE_INTERFACE || opcode == OP_INVOKE_INTERFACE_RANGE) { // see Interp.cpp-dvmInterpFindInterfaceMethod
+                ref = insns[1];             // method ref 
+            
+                Method* absMethod;
+                absMethod = dvmDexGetResolvedMethod(methodClassDex, ref);
+                if (absMethod == NULL) {
+                    absMethod = resolveInterfaceMethod(method->clazz, ref);
+                     if(absMethod == NULL) { // we should have encountered a wrong version method branch
+                        return;
+                    }
+                }
+                assert(dvmIsAbstractMethod(absMethod));
+            
+                std::vector<ClassObject*>* implclasses = findImplementClass(absMethod->clazz);
+                // use this vector to store the method which have been parsed since it seems that the method which is not overriden by its subclass will have the same reference
+                std::set<Method*> parsedMethod;
+                
+                for(unsigned int idx = 0; idx < implclasses->size(); idx++) {
+                    Method* methodToCall;
+                    int ifIdx;
+                    for (ifIdx = 0; ifIdx < implclasses->at(idx)->iftableCount; ifIdx++) {
+                        if (implclasses->at(idx)->iftable[ifIdx].clazz == absMethod->clazz) {
+                            break;
+                        }
+                    }
+                    int vtableIndex = implclasses->at(idx)->iftable[ifIdx].methodIndexArray[absMethod->methodIndex];
+                    methodToCall = implclasses->at(idx)->vtable[vtableIndex];
+                    assert(methodToCall != NULL);
+                    if(parsedMethod.find(methodToCall) != parsedMethod.end()) {
+                        continue;
+                    } else {
+                        parsedMethod.insert(methodToCall);
+                    }
+                    scanStatic(methodToCall, methodAccInfo, clazzAccMap, chain);
+                }
+            } else if(opcode == OP_INVOKE_SUPER || opcode == OP_INVOKE_DIRECT || opcode == OP_INVOKE_STATIC 
+                || opcode == OP_INVOKE_SUPER_RANGE || opcode == OP_INVOKE_DIRECT_RANGE || opcode == OP_INVOKE_STATIC_RANGE) {
+                ref = insns[1];             // method ref 
+            
+                Method* methodToCall;
+                if(opcode == OP_INVOKE_SUPER || opcode == OP_INVOKE_SUPER_RANGE) {
+                    Method* baseMethod;
+                    baseMethod = dvmDexGetResolvedMethod(methodClassDex, ref);
+                    if (baseMethod == NULL) {
+                        baseMethod = resolveMethod(method->clazz, ref, METHOD_VIRTUAL);
+                        if(baseMethod == NULL) { // we should have encountered a wrong version method branch
+                            return;
+                        }
+                    }
+                    assert(baseMethod->methodIndex < method->clazz->super->vtableCount);
+                    methodToCall = method->clazz->super->vtable[baseMethod->methodIndex];
+                } else if(opcode == OP_INVOKE_DIRECT || opcode == OP_INVOKE_DIRECT_RANGE) {
+                    methodToCall = dvmDexGetResolvedMethod(methodClassDex, ref);
+                    if (methodToCall == NULL) {
+                        methodToCall = resolveMethod(method->clazz, ref, METHOD_DIRECT);
+                    }
+                } else {
+                    methodToCall = dvmDexGetResolvedMethod(methodClassDex, ref);
+                    if (methodToCall == NULL) {
+                        methodToCall = resolveMethod(method->clazz, ref, METHOD_STATIC);
+                    }
+                } 
+                if(methodToCall == NULL) { // we should have encountered a wrong version method branch
+                    return;
+                }
+                scanStatic(methodToCall, methodAccInfo, clazzAccMap, chain);
+            }
+        }
+        methodStaticMap[method] = clazzAccMap;
+    }
+    //ALOGE("scan end, the size is: %d", clazzAccMap->size());
+    chain->erase(method);
+    if(caller != NULL) {
+        for (std::map<ClassObject*, BitsVec*>::iterator it = clazzAccMap->begin(); it != clazzAccMap->end(); ++it) {
+            if(caller->find(it->first) == caller->end()) {
+                (*caller)[it->first] = new BitsVec();
+            }
+            BitsVec* clazzAccInfo = (*caller)[it->first];
+            BitsVec* subAccInfo = it->second;
+            u4 sz = (subAccInfo->size >> 5) + 1;
+            if(clazzAccInfo->size < subAccInfo->size || (clazzAccInfo->size == subAccInfo->size && subAccInfo->size == 0)) {
+                u4* newbits = (u4*)calloc(sz, 4);
+                if(clazzAccInfo->bits != NULL) {
+                    memcpy(newbits, clazzAccInfo->bits, ((clazzAccInfo->size >> 5) + 1) << 2);
+                    free(clazzAccInfo->bits);
+                }
+                clazzAccInfo->bits = newbits;
+                clazzAccInfo->size = subAccInfo->size;
+            }
+            for(u4 i = 0; i < sz; i++) {
+                clazzAccInfo->bits[i] = clazzAccInfo->bits[i] | subAccInfo->bits[i];
+            }
+        }
+    } else {
+        for (std::map<ClassObject*, BitsVec*>::iterator it = clazzAccMap->begin(); it != clazzAccMap->end(); ++it) {
+            unsigned int i;
+            for(i = 0; i < methodAccInfo->globalClazz->size(); i++) {
+                if(it->first == methodAccInfo->globalClazz->at(i)->clazz) {
+                    break;
+                }
+            }
+            if(i == methodAccInfo->globalClazz->size()) { // The first time to deal this global class object
+                ClazzAccInfo* clazzAccInfo = new ClazzAccInfo();
+                clazzAccInfo->clazz = it->first;
+                methodAccInfo->globalClazz->push_back(clazzAccInfo);
+            }
+            ClazzAccInfo* clazzAccInfo = methodAccInfo->globalClazz->at(i);
+            BitsVec* subAccInfo = it->second;
+            if(clazzAccInfo->fieldSet.size() < subAccInfo->size + 1) {
+                clazzAccInfo->fieldSet.resize(subAccInfo->size + 1);
+                clazzAccInfo->trackSet.resize(subAccInfo->size + 1);
+            }
+            for(i = 0; i < subAccInfo->size + 1; i++) {
+                if((subAccInfo->bits[i >> 5] & (1U << (i & 0x1F))) == 0) {
+                    continue;
+                } 
+                if(clazzAccInfo->fieldSet[i] == NULL) {
+                    ObjectAccInfo* fieldInfo = new ObjectAccInfo();
+                    fieldInfo->allFlag = true;
+                    clazzAccInfo->fieldSet[i] = fieldInfo;
+                    if(clazzAccInfo->trackSet[i] == NULL) {
+                        clazzAccInfo->trackSet[i] = new std::vector<ObjectAccInfo*>();
+                        clazzAccInfo->trackSet[i]->push_back(clazzAccInfo->fieldSet[i]);
+                    }
+                } else {
+                    clazzAccInfo->fieldSet[i]->allFlag = true;
+                }
+            }
+        }
+    }
+    //delete clazzAccMap;
+}
+
+void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>* chain, std::vector<int>* insOffsets, std::map<u2, std::vector<ObjectAccInfo*> >* interestRegObjMap, int depth, bool* exitMethod) {
     if(*exitMethod) {
         return;
     }
@@ -1025,7 +1234,7 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Metho
                     return;
                 }
             }
-            offset = ifield->byteOffset >> 2;
+            offset = (ifield->byteOffset - sizeof(Object)) >> 2;
             
             // set the field of the object as accessed
             std::vector<ObjectAccInfo*> accVector = (*interestRegObjMap)[vsrc1];
@@ -1070,7 +1279,7 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Metho
                     return;
                 }
             }
-            offset = ifield->byteOffset >> 2;
+            offset = (ifield->byteOffset - sizeof(Object)) >> 2;
             
             // both src object and dst are not in our interest
             if(interestRegObjMap->find(vdst) == interestRegObjMap->end() && interestRegObjMap->find(vsrc1) == interestRegObjMap->end()) {
@@ -1238,17 +1447,6 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Metho
                 methodAccInfo->curMethodReturns = NULL;
             }
             
-            // check if the method invocation involves interesting registers
-            bool hasInterest;
-            if(opcode == OP_INVOKE_VIRTUAL) {
-                hasInterest = methodHasInterest(vsrc1, vdst, interestRegObjMap);
-            } else {
-                hasInterest = rangeMethodHasInterest(vsrc1, vdst, interestRegObjMap);
-            }
-            if(!hasInterest) {
-                continue;
-            }
-            
             int voffset;
             Method* baseMethod;
             baseMethod = dvmDexGetResolvedMethod(methodClassDex, ref);
@@ -1258,6 +1456,34 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Metho
                     return;
                 }
             }
+            voffset = baseMethod->methodIndex;
+            
+            // check if the method invocation involves interesting registers
+            bool hasInterest;
+            if(opcode == OP_INVOKE_VIRTUAL) {
+                hasInterest = methodHasInterest(vsrc1, vdst, interestRegObjMap);
+            } else {
+                hasInterest = rangeMethodHasInterest(vsrc1, vdst, interestRegObjMap);
+            }
+            if(!hasInterest) {
+                /*std::vector<ClassObject*>* subclasses = findSubClass(baseMethod->clazz);
+                // use this vector to store the method which have been parsed since it seems that the method which is not overriden by its subclass will have the same reference
+                std::set<Method*> parsedMethod;
+                
+                for(unsigned int idx = 0; idx < subclasses->size(); idx++) {
+                    Method* methodToCall = subclasses->at(idx)->vtable[voffset];
+                    assert(methodToCall != NULL);
+                    if(parsedMethod.find(methodToCall) != parsedMethod.end()) {
+                        continue;
+                    } else {
+                        parsedMethod.insert(methodToCall);
+                    }
+                    std::set<Method*> mchain;
+                    scanStatic(methodToCall, methodAccInfo, NULL, &mchain);
+                }*/
+                continue;
+            }
+            
             bool isLangObjectClass = baseMethod->clazz == javaLangObject;
             bool isExempt = false;
             for(unsigned int idx = 0; idx < exemptClzs->size(); idx++) {
@@ -1272,6 +1498,21 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Metho
                 } else {
                     rangeMethodRegsFlagAll(vsrc1, vdst, interestRegObjMap);
                 }
+                /*std::vector<ClassObject*>* subclasses = findSubClass(baseMethod->clazz);
+                // use this vector to store the method which have been parsed since it seems that the method which is not overriden by its subclass will have the same reference
+                std::set<Method*> parsedMethod;
+                
+                for(unsigned int idx = 0; idx < subclasses->size(); idx++) {
+                    Method* methodToCall = subclasses->at(idx)->vtable[voffset];
+                    assert(methodToCall != NULL);
+                    if(parsedMethod.find(methodToCall) != parsedMethod.end()) {
+                        continue;
+                    } else {
+                        parsedMethod.insert(methodToCall);
+                    }
+                    std::set<Method*> mchain;
+                    scanStatic(methodToCall, methodAccInfo, NULL, &mchain);
+                }*/
                 continue;
             }
             //ALOGE("methodParser parse virtual %s.%s", baseMethod->clazz->descriptor, baseMethod->name);
@@ -1282,10 +1523,8 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Metho
                 subAccInfo = new MethodAccInfo();
                 subAccInfo->method = baseMethod;
                 populateMethodAccInfo(subAccInfo);
-                voffset = baseMethod->methodIndex;
-                std::vector<ClassObject*> subclasses;
-                findSubClass(baseMethod->clazz, &subclasses);
-                if(subclasses.size() > MaxSubCount) {
+                std::vector<ClassObject*>* subclasses = findSubClass(baseMethod->clazz);
+                if(subclasses->size() > MaxSubCount) {
                     //ALOGE("method: %s.%s, size is: %u", baseMethod->clazz->descriptor, baseMethod->name, subclasses.size());
                     if(opcode == OP_INVOKE_VIRTUAL) {
                         methodRegsFlagAll(vsrc1, vdst, interestRegObjMap);
@@ -1295,22 +1534,15 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Metho
                     continue;
                 }
                 // use this vector to store the method which have been parsed since it seems that the method which is not overriden by its subclass will have the same reference
-                std::vector<Method*> parsedMethod;
+                std::set<Method*> parsedMethod;
                 
-                for(unsigned int idx = 0; idx < subclasses.size(); idx++) {
-                    Method* methodToCall = subclasses[idx]->vtable[voffset];
+                for(unsigned int idx = 0; idx < subclasses->size(); idx++) {
+                    Method* methodToCall = subclasses->at(idx)->vtable[voffset];
                     assert(methodToCall != NULL);
-                    bool alreadyParsed = false;
-                    for(unsigned int i = 0; i < parsedMethod.size(); i++) {
-                        if(methodToCall == parsedMethod[i]) {
-                            alreadyParsed = true;
-                            break;
-                        }
-                    }
-                    if(alreadyParsed) {
+                    if(parsedMethod.find(methodToCall) != parsedMethod.end()) {
                         continue;
                     } else {
-                        parsedMethod.push_back(methodToCall);
+                        parsedMethod.insert(methodToCall);
                     }
                     MethodAccInfo* toCallAccInfo;
                     if(methodResMap.find(methodToCall) == methodResMap.end()) {
@@ -1337,17 +1569,6 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Metho
                 methodAccInfo->curMethodReturns = NULL;
             }
             
-            // check if the method invocation involves interesting registers
-            bool hasInterest;
-            if(opcode == OP_INVOKE_INTERFACE) {
-                hasInterest = methodHasInterest(vsrc1, vdst, interestRegObjMap);
-            } else {
-                hasInterest = rangeMethodHasInterest(vsrc1, vdst, interestRegObjMap);
-            }
-            if(!hasInterest) {
-                continue;
-            }
-            
             Method* absMethod;
             absMethod = dvmDexGetResolvedMethod(methodClassDex, ref);
             if (absMethod == NULL) {
@@ -1357,6 +1578,41 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Metho
                 }
             }
             assert(dvmIsAbstractMethod(absMethod));
+            
+            // check if the method invocation involves interesting registers
+            bool hasInterest;
+            if(opcode == OP_INVOKE_INTERFACE) {
+                hasInterest = methodHasInterest(vsrc1, vdst, interestRegObjMap);
+            } else {
+                hasInterest = rangeMethodHasInterest(vsrc1, vdst, interestRegObjMap);
+            }
+            if(!hasInterest) {
+                /*std::vector<ClassObject*>* implclasses = findImplementClass(absMethod->clazz);
+                // use this vector to store the method which have been parsed since it seems that the method which is not overriden by its subclass will have the same reference
+                std::set<Method*> parsedMethod;
+                
+                for(unsigned int idx = 0; idx < implclasses->size(); idx++) {
+                    Method* methodToCall;
+                    int ifIdx;
+                    for (ifIdx = 0; ifIdx < implclasses->at(idx)->iftableCount; ifIdx++) {
+                        if (implclasses->at(idx)->iftable[ifIdx].clazz == absMethod->clazz) {
+                            break;
+                        }
+                    }
+                    int vtableIndex = implclasses->at(idx)->iftable[ifIdx].methodIndexArray[absMethod->methodIndex];
+                    methodToCall = implclasses->at(idx)->vtable[vtableIndex];
+                    assert(methodToCall != NULL);
+                    if(parsedMethod.find(methodToCall) != parsedMethod.end()) {
+                        continue;
+                    } else {
+                        parsedMethod.insert(methodToCall);
+                    }
+                    std::set<Method*> mchain;
+                    scanStatic(methodToCall, methodAccInfo, NULL, &mchain);
+                }*/
+                continue;
+            }
+            
             bool isExempt = false;
             for(unsigned int idx = 0; idx < exemptIfs->size(); idx++) {
                 if(absMethod->clazz == exemptIfs->at(idx)) {
@@ -1370,6 +1626,29 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Metho
                 } else {
                     rangeMethodRegsFlagAll(vsrc1, vdst, interestRegObjMap);
                 }
+                /*std::vector<ClassObject*>* implclasses = findImplementClass(absMethod->clazz);
+                // use this vector to store the method which have been parsed since it seems that the method which is not overriden by its subclass will have the same reference
+                std::set<Method*> parsedMethod;
+                
+                for(unsigned int idx = 0; idx < implclasses->size(); idx++) {
+                    Method* methodToCall;
+                    int ifIdx;
+                    for (ifIdx = 0; ifIdx < implclasses->at(idx)->iftableCount; ifIdx++) {
+                        if (implclasses->at(idx)->iftable[ifIdx].clazz == absMethod->clazz) {
+                            break;
+                        }
+                    }
+                    int vtableIndex = implclasses->at(idx)->iftable[ifIdx].methodIndexArray[absMethod->methodIndex];
+                    methodToCall = implclasses->at(idx)->vtable[vtableIndex];
+                    assert(methodToCall != NULL);
+                    if(parsedMethod.find(methodToCall) != parsedMethod.end()) {
+                        continue;
+                    } else {
+                        parsedMethod.insert(methodToCall);
+                    }
+                    std::set<Method*> mchain;
+                    scanStatic(methodToCall, methodAccInfo, NULL, &mchain);
+                }*/
                 continue;
             }
             
@@ -1381,9 +1660,8 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Metho
                 subAccInfo = new MethodAccInfo();
                 subAccInfo->method = absMethod;
                 populateMethodAccInfo(subAccInfo);
-                std::vector<ClassObject*> implclasses;
-                findImplementClass(absMethod->clazz, &implclasses);
-                if(implclasses.size() > MaxSubCount) {
+                std::vector<ClassObject*>* implclasses = findImplementClass(absMethod->clazz);
+                if(implclasses->size() > MaxSubCount) {
                     //ALOGE("method: %s.%s, size is: %u", absMethod->clazz->descriptor, absMethod->name, implclasses.size());
                     if(opcode == OP_INVOKE_VIRTUAL) {
                         methodRegsFlagAll(vsrc1, vdst, interestRegObjMap);
@@ -1393,30 +1671,23 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Metho
                     continue;
                 }
                 // use this vector to store the method which have been parsed since it seems that the method which is not overriden by its subclass will have the same reference
-                std::vector<Method*> parsedMethod;
+                std::set<Method*> parsedMethod;
                 
-                for(unsigned int idx = 0; idx < implclasses.size(); idx++) {
+                for(unsigned int idx = 0; idx < implclasses->size(); idx++) {
                     Method* methodToCall;
                     int ifIdx;
-                    for (ifIdx = 0; ifIdx < implclasses[idx]->iftableCount; ifIdx++) {
-                        if (implclasses[idx]->iftable[ifIdx].clazz == absMethod->clazz) {
+                    for (ifIdx = 0; ifIdx < implclasses->at(idx)->iftableCount; ifIdx++) {
+                        if (implclasses->at(idx)->iftable[ifIdx].clazz == absMethod->clazz) {
                             break;
                         }
                     }
-                    int vtableIndex = implclasses[idx]->iftable[ifIdx].methodIndexArray[absMethod->methodIndex];
-                    methodToCall = implclasses[idx]->vtable[vtableIndex];
+                    int vtableIndex = implclasses->at(idx)->iftable[ifIdx].methodIndexArray[absMethod->methodIndex];
+                    methodToCall = implclasses->at(idx)->vtable[vtableIndex];
                     assert(methodToCall != NULL);
-                    bool alreadyParsed = false;
-                    for(unsigned int i = 0; i < parsedMethod.size(); i++) {
-                        if(methodToCall == parsedMethod[i]) {
-                            alreadyParsed = true;
-                            break;
-                        }
-                    }
-                    if(alreadyParsed) {
+                    if(parsedMethod.find(methodToCall) != parsedMethod.end()) {
                         continue;
                     } else {
-                        parsedMethod.push_back(methodToCall);
+                        parsedMethod.insert(methodToCall);
                     }
                     MethodAccInfo* toCallAccInfo;
                     if(methodResMap.find(methodToCall) == methodResMap.end()) {
@@ -1551,7 +1822,7 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Metho
                 std::map<u2, std::vector<ObjectAccInfo*> > tempInterest = *interestRegObjMap;
                 int newDepth = depth + 1;
                 // If we reach the maximum branch depth, we exit the parse of the method to save the cost of parse
-                if(newDepth == MaxBranchDepth) {
+                if(newDepth >= MaxBranchDepth) {
                     for(unsigned int i = 0; i < methodAccInfo->args->size(); i++) {
                         flagObjAll(methodAccInfo->args->at(i));
                     }
@@ -1658,7 +1929,7 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Metho
                     std::map<u2, std::vector<ObjectAccInfo*> > tempInterest = *interestRegObjMap;
                     int newDepth = depth + 1;
                     // If we reach the maximum branch depth, we exit the parse of the method to save the cost of parse
-                    if(newDepth == MaxBranchDepth) {
+                    if(newDepth >= MaxBranchDepth) {
                         for(unsigned int i = 0; i < methodAccInfo->args->size(); i++) {
                             flagObjAll(methodAccInfo->args->at(i));
                         }
@@ -1754,9 +2025,9 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Metho
             || opcode == OP_UNUSED_41 || opcode == OP_UNUSED_42 || opcode == OP_UNUSED_43
             || opcode == OP_UNUSED_73 || opcode == OP_UNUSED_79 || opcode == OP_UNUSED_7A) {
             // do nothing
-        } else if(opcode == OP_ARRAY_LENGTH)  {
+        } else if(opcode == OP_ARRAY_LENGTH)  { // we would migrate the length of array anyway
             vdst = inst_a(insns);
-            vsrc1 = inst_b(insns);
+            /*vsrc1 = inst_b(insns);
             // check if the source register is in our interest list
             if(interestRegObjMap->find(vsrc1) == interestRegObjMap->end()) {
                 continue;
@@ -1783,7 +2054,7 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Metho
                     objAccInfo->trackSet[offset] = new std::vector<ObjectAccInfo*>();
                     objAccInfo->trackSet[offset]->push_back(objAccInfo->fieldSet[offset]);
                 }
-            }
+            }*/
             // erase to set the result not be interest any more
             interestRegObjMap->erase(vdst);
         } else if(opcode == OP_FILLED_NEW_ARRAY || opcode == OP_FILLED_NEW_ARRAY_RANGE) {
@@ -1858,7 +2129,7 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Metho
     }
 }
 
-MethodAccInfo* parseMethod(Method* method, std::vector<Method*>* chain) {
+MethodAccInfo* parseMethod(Method* method, std::set<Method*>* chain) {
     if(methodResMap.find(method) != methodResMap.end()) {
         return methodResMap[method];
     }
@@ -1867,12 +2138,8 @@ MethodAccInfo* parseMethod(Method* method, std::vector<Method*>* chain) {
     populateMethodAccInfo(methodAccInfo);
     bool isCycle = false;
     // check if this method makes an invocation cycle, if true, then set all the parameters as need to be migrate all
-    for(unsigned int idx = 0; idx < chain->size(); idx++) {
-        if(method == chain->at(idx)) {
-            //ALOGE("methodParser find cycle, methodToCall: %p, name: %s.%s, chain method: %p, name: %s.%s", methodToCall, methodToCall->clazz->descriptor, methodToCall->name, chain->at(idx), chain->at(idx)->clazz->descriptor, chain->at(idx)->name);
-            isCycle = true;
-            break;                    
-        }
+    if(chain->find(method) != chain->end()) {
+        isCycle = true;
     }
     // a method invocation cycle, an abstract or native method cannot be parsed, then we just set all the parameters as need migration
     if(isCycle || dvmIsNativeMethod(method) || dvmIsAbstractMethod(method)) {
@@ -1882,7 +2149,7 @@ MethodAccInfo* parseMethod(Method* method, std::vector<Method*>* chain) {
         methodResMap[method] = methodAccInfo;
         return methodAccInfo;
     }
-    chain->push_back(method);
+    chain->insert(method);
     // declare a map which will contain the list of registers the method should track
     // in each register, we use a vector to track all the possible object this vector might store
     std::map<u2, std::vector<ObjectAccInfo*> > interestRegObjMap;
@@ -1913,14 +2180,18 @@ MethodAccInfo* parseMethod(Method* method, std::vector<Method*>* chain) {
     bool exitMethod = false;
     parseInsns(insns, methodAccInfo, chain, &insOffsets, &interestRegObjMap, depth, &exitMethod);
     
-    chain->pop_back();
+    chain->erase(method);
     methodResMap[method] = methodAccInfo;
     
     return methodAccInfo;
 }
 
-
-void findSubClass(ClassObject* clazz, std::vector<ClassObject*>* result) {
+std::vector<ClassObject*>* findSubClass(ClassObject* clazz) {
+    if(subclassMap.find(clazz) != subclassMap.end()) {
+        return subclassMap[clazz];
+    }
+    std::vector<ClassObject*>* result = new std::vector<ClassObject*>();
+    subclassMap[clazz] = result;
     for(unsigned int idx = 0; idx < loadedDex.size(); idx++) {
         DvmDex* pDvmDex;
         pDvmDex = loadedDex[idx];
@@ -1950,12 +2221,18 @@ void findSubClass(ClassObject* clazz, std::vector<ClassObject*>* result) {
             }
         }
     }
+    return result;
     /*for(unsigned int i = 0; i < (*result).size(); i++) {
         ALOGE("findsubclass class: %s", (*result)[i]->descriptor);
     }*/
 }
 
-void findImplementClass(ClassObject* clazz, std::vector<ClassObject*>* result) {
+std::vector<ClassObject*>* findImplementClass(ClassObject* clazz) {
+    if(implclassMap.find(clazz) != implclassMap.end()) {
+        return implclassMap[clazz];
+    }
+    std::vector<ClassObject*>* result = new std::vector<ClassObject*>();
+    implclassMap[clazz] = result;
     for(unsigned int idx = 0; idx < loadedDex.size(); idx++) {
         DvmDex* pDvmDex;
         pDvmDex = loadedDex[idx];
@@ -1985,6 +2262,7 @@ void findImplementClass(ClassObject* clazz, std::vector<ClassObject*>* result) {
             }
         }
     }
+    return result;
    /* for(unsigned int i = 0; i < (*result).size(); i++) {
         ALOGE("findimplementedclass class: %s", (*result)[i]->descriptor);
     }*/
@@ -1992,11 +2270,11 @@ void findImplementClass(ClassObject* clazz, std::vector<ClassObject*>* result) {
 
 void depthTraverse(ObjectAccInfo* objAccInfo, int depth) {
     if(objAccInfo->allFlag) {
-        ALOGE("methodParser depth: %d, allFlag is: %d", depth, objAccInfo->allFlag);
+    //    ALOGE("methodParser depth: %d, allFlag is: %d", depth, objAccInfo->allFlag);
         return;
     }
     for(unsigned int i = 0; i < objAccInfo->fieldSet.size(); i++) {
-        ALOGE("methodParser depth: %d, offset: %d, value is: %d", depth, i, objAccInfo->fieldSet[i] != NULL);
+    //    ALOGE("methodParser depth: %d, offset: %d, value is: %d", depth, i, objAccInfo->fieldSet[i] != NULL);
         if(objAccInfo->fieldSet[i] != NULL) {
             depthTraverse(objAccInfo->fieldSet[i], depth + 1);
         }
@@ -2039,22 +2317,22 @@ void persistMethodInfo(MethodAccInfo* methodAccInfo, const char* fileName) {
         writeObjAccInfo(methodAccInfo->args->at(i), &dstfile);
     }
     dstfile << std::endl;
-    for(unsigned int i = 0; i < methodAccInfo->globalClazz->size(); i++) {
+    /*for(unsigned int i = 0; i < methodAccInfo->globalClazz->size(); i++) {
         dstfile << methodAccInfo->globalClazz->at(i)->clazz->descriptor << std::endl;
         writeObjAccInfo(methodAccInfo->globalClazz->at(i), &dstfile);
     }
-    dstfile << std::endl;
+    dstfile << std::endl;*/
     dstfile.close();
 }
 
 void depthTraverseResult(ObjectAccResult* objAccResult, int depth) {
     if(objAccResult->allFlag) {
-        ALOGE("methodParser result depth: %d, allFlag is: %d", depth, objAccResult->allFlag);
+        //ALOGE("methodParser result depth: %d, allFlag is: %d", depth, objAccResult->allFlag);
         return;
     }
-    ALOGE("methodParser result depth: %d, value is: %u:%u", depth, objAccResult->migrate, objAccResult->highbits == NULL ? 0 : *(objAccResult->highbits));
+    //ALOGE("methodParser result depth: %d, value is: %u:%u", depth, objAccResult->migrate, objAccResult->highbits == NULL ? 0 : *(objAccResult->highbits));
     for(unsigned int i = 0; i < objAccResult->fieldSet.size(); i++) {
-        ALOGE("methodParser result depth: %d, offset: %d, value is: %d", depth, i, objAccResult->fieldSet[i] != NULL);
+        //ALOGE("methodParser result depth: %d, offset: %d, value is: %d", depth, i, objAccResult->fieldSet[i] != NULL);
         if(objAccResult->fieldSet[i] != NULL) {
             depthTraverseResult(objAccResult->fieldSet[i], depth + 1);
         }
@@ -2068,15 +2346,13 @@ void setMigrateBits(ObjectAccResult* objAccResult) {
     objAccResult->migrate = 0x00000000U;
     unsigned int lowBitSize = objAccResult->fieldSet.size() > 32 ? 32 : objAccResult->fieldSet.size();
     for(unsigned int i = 0; i < lowBitSize; i++) {
-        // we set the first 4 fields as always need to be migrated
-        if(objAccResult->fieldSet[i] != NULL || i < 4) {
+        if(objAccResult->fieldSet[i] != NULL) {
             objAccResult->migrate = objAccResult->migrate | (1U << i);
         }
     }
     if(objAccResult->fieldSet.size() > 32) {
         u4 sz = (objAccResult->fieldSet.size() - 1) >> 5;
-        objAccResult->highbits = (u4*)malloc(sz << 2);
-        memset(objAccResult->highbits, 0x00, sz << 2);
+        objAccResult->highbits = (u4*)calloc(sz, 4);
         for(unsigned int i = 32; i < objAccResult->fieldSet.size(); i++) {
             if(objAccResult->fieldSet[i] != NULL) {
                 int32_t val = 1U << (i & 0x1F);
@@ -2092,20 +2368,15 @@ void setMigrateBits(ObjectAccResult* objAccResult) {
     }
 }
 
-void retrieveMethodInfo(std::map<char*, MethodAccResult*>* methodAccMap, const char* fileName) {
+void retrieveMethodInfo(std::map<char*, MethodAccResult*, charscomp>* methodAccMap, const char* fileName) {
     std::ifstream srcfile;
     srcfile.open(fileName);
     std::string line;
     while(std::getline(srcfile, line)) {
         MethodAccResult* methodAccResult = new MethodAccResult();
-        (*methodAccMap)[strdup(line.c_str())] = methodAccResult;
-        std::string clazzDescStr = line.substr(0, line.find(" "));
-        std::string methodNameStr = line.substr(line.find(" ") + 1, line.find_last_of(" ") - line.find(" ") - 1);
-        std::string idxStr = line.substr(line.find_last_of(" ") + 1);
-        methodAccResult->clazzDesc = strdup(clazzDescStr.c_str());
-        methodAccResult->methodName = strdup(methodNameStr.c_str());
-        char *end;
-        methodAccResult->idx = strtoul(idxStr.c_str(), &end, 10);
+        char* methodInfo = new char[line.length() + 1];
+        strcpy(methodInfo, line.c_str());
+        (*methodAccMap)[methodInfo] = methodAccResult;
         methodAccResult->args = new std::vector<ObjectAccResult*>();
         while(true) {
             std::getline(srcfile, line);
@@ -2141,7 +2412,7 @@ void retrieveMethodInfo(std::map<char*, MethodAccResult*>* methodAccMap, const c
                 }
             }
         }
-        methodAccResult->globalClazz = new std::vector<ClazzAccResult*>();
+        /*methodAccResult->globalClazz = new std::vector<ClazzAccResult*>();
         while(true) {
             std::getline(srcfile, line);
             if(line.compare("") == 0) {
@@ -2177,14 +2448,14 @@ void retrieveMethodInfo(std::map<char*, MethodAccResult*>* methodAccMap, const c
                     current->fieldSet.push_back(newAcc);
                 }
             }
-        }
+        }*/
         // set migrate bits for this method info
         for(unsigned int i = 0; i < methodAccResult->args->size(); i++) {
             setMigrateBits(methodAccResult->args->at(i));
         }
-        for(unsigned int i = 0; i < methodAccResult->globalClazz->size(); i++) {
+        /*for(unsigned int i = 0; i < methodAccResult->globalClazz->size(); i++) {
             setMigrateBits(methodAccResult->globalClazz->at(i));
-        }
+        }*/
     }
     srcfile.close();
 }

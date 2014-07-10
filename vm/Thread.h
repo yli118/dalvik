@@ -328,11 +328,15 @@ struct Thread {
     bool             offLocal;         /* Is the thread running locally. */
     bool             offFlagDeath;
     bool             offTrimSignaled;
-    void*            offSyncStackStop;
+    bool             isMethodStart;    /* indicate if the migration happening at the start of method */
+    bool             isMethodReturn;   /* indicate if the migration happening at the return of method */
+    u1               returnType;     /* indicate if the return is void */
+//    void*            offSyncStackStop;//todel
+    u4*              offStackFpStop;  /* frame pointer where migration should stop */
 
-    u4               offTimeCounter;
-    u8               offUnsafeTime;    /* Indicates last time execution had to
-                                          be local.  Only used for client. */
+    u2               retReg;          /* indicates which register will be used as a return value from method */
+//    u4               offTimeCounter;//todel
+//    u8               offUnsafeTime;  //todel  /* Indicates last time execution had to be local.  Only used for client. */
 
     Object*          offLockList[16];  /* Recently locked object ids. */
 

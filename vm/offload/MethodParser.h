@@ -7,6 +7,13 @@
 #include <string>
 #include <set>
 
+struct charscomp;
+
+struct BitsVec {
+    u4* bits;
+    u4 size;
+};
+
 /* structure indicates which fields of object have been accessed */
 struct ObjectAccInfo {
     // flag indicates that all the attribute of the object should be marked as accessed to assure correctness
@@ -67,11 +74,11 @@ struct ClazzAccResult : ObjectAccResult {
 };
 
 struct MethodAccResult {
-    char* clazzDesc;
+    //char* clazzDesc;
     
-    char* methodName;
+    //char* methodName;
     
-    u4 idx;
+    //u4 idx;
     
     std::vector<ObjectAccResult*>* args;
     
@@ -80,11 +87,17 @@ struct MethodAccResult {
 
 
 void populateMethodAccInfo(MethodAccInfo* methodAccInfo);
-MethodAccInfo* parseMethod(Method* method, std::vector<Method*>* chain);
-void findSubClass(ClassObject* clazz, std::vector<ClassObject*>* result);
-void findImplementClass(ClassObject* clazz, std::vector<ClassObject*>* result);
+MethodAccInfo* parseMethod(Method* method, std::set<Method*>* chain);
+std::vector<ClassObject*>* findSubClass(ClassObject* clazz);
+std::vector<ClassObject*>* findImplementClass(ClassObject* clazz);
 void depthTraverse(ObjectAccInfo* objAccInfo, int depth);
 void freeMethodAccInfo(MethodAccInfo* methodAccInfo);
 void persistMethodInfo(MethodAccInfo* methodAccInfo, const char* fileName);
-void retrieveMethodInfo(std::map<char*, MethodAccResult*>* methodAccMap, const char* fileName);
+void retrieveMethodInfo(std::map<char*, MethodAccResult*, charscomp>* methodAccMap, const char* fileName);
 void depthTraverseResult(ObjectAccResult* objAccResult, int depth);
+ClassObject* resolveClass(const ClassObject* referrer, u4 classIdx, bool fromUnverifiedConstant);
+Method* resolveMethod(const ClassObject* referrer, u4 methodIdx, MethodType methodType);
+Method* resolveInterfaceMethod(const ClassObject* referrer, u4 methodIdx);
+InstField* resolveInstField(const ClassObject* referrer, u4 ifieldIdx);
+StaticField* resolveStaticField(const ClassObject* referrer, u4 sfieldIdx);
+

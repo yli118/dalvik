@@ -82,7 +82,7 @@ static int cleanupThread(Thread* thread, void* parg) {
   thread->offFlagMigration = false;
   thread->offLocalOnly = true;
   assert(thread->offLocal);
-  thread->offSyncStackStop = NULL;
+//  thread->offSyncStackStop = NULL;
 
   auxFifoDestroy(&thread->offWriteBuffer);
   auxFifoDestroy(&thread->offReadBuffer);
@@ -185,6 +185,10 @@ static void cleanupOffloadState(Thread* self) {
       if(info && info->obj) {
         info->obj->objId = COMM_INVALID_ID;
         free(info->bits);
+        if(info->highbits != NULL) {
+          free(info->highbits);
+          info->highbits = NULL;
+        }
       }
     }
     offTableDestroy(&gDvm.objTables[i]);

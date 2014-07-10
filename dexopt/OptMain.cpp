@@ -556,6 +556,9 @@ bail:
  */
 int main(int argc, char* const argv[])
 {
+#if defined(WITH_OFFLOAD)
+    gDvm.offDisabled = true;
+#endif
     set_process_name("dexopt");
 
     setvbuf(stdout, NULL, _IONBF, 0);

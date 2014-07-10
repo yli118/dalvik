@@ -195,7 +195,7 @@ static bool prepareCpe(ClassPathEntry* cpe, bool isBootstrap)
     ALOGD("Unable to process classpath element '%s'", cpe->fileName);
     return false;
 }
-static ClassPathEntry* processClassPath(const char* pathStr, bool isBootstrap)
+ClassPathEntry* processClassPath(const char* pathStr)
 {
     ClassPathEntry* cpe = NULL;
     char* mangle;
@@ -242,13 +242,6 @@ static ClassPathEntry* processClassPath(const char* pathStr, bool isBootstrap)
         if (*cp == '\0') {
             /* leading, trailing, or doubled ':'; ignore it */
         } else {
-            if (isBootstrap &&
-                    dvmPathToAbsolutePortion(cp) == NULL) {
-                ALOGE("Non-absolute bootclasspath entry '%s'", cp);
-                free(cpe);
-                cpe = NULL;
-                goto bail;
-            }
 
             ClassPathEntry tmp;
             tmp.kind = kCpeUnknown;
@@ -263,7 +256,7 @@ static ClassPathEntry* processClassPath(const char* pathStr, bool isBootstrap)
             cpe[idx].fileName = NULL;
             cpe[idx].ptr = NULL;
 
-            if (!prepareCpe(&tmp, isBootstrap)) {
+            if (!prepareCpe(&tmp, false)) {
                 /* drop from list and continue on */
                 free(tmp.fileName);
             } else {
@@ -295,7 +288,6 @@ static ClassPathEntry* processClassPath(const char* pathStr, bool isBootstrap)
 
     //dumpClassPath(cpe);
 
-bail:
     free(mangle);
     gDvm.bootClassPath = cpe;
     return cpe;
@@ -365,24 +357,24 @@ void filterExempt(const char* className, ClassObject* resClass) {
         }
     } else {
         // filter class
-        if(strcmp(className, "Ljava/util/AbstractMap;") == 0) {
-            exemptClzs->push_back(resClass);
-        } else if(strcmp(className, "Ljava/util/AbstractCollection;") == 0) {
-            exemptClzs->push_back(resClass);
-        } else if(strcmp(className, "Landroid/os/Parcel;") == 0) {
-            exemptClzs->push_back(resClass);
-        } else if(strcmp(className, "Ljava/lang/AbstractStringBuilder;") == 0) {
-            exemptClzs->push_back(resClass);
-        } else if(strcmp(className, "Landroid/os/Bundle;") == 0) {
-            exemptClzs->push_back(resClass);
-        } else if(strcmp(className, "Ljava/io/PrintWriter;") == 0) {
-            exemptClzs->push_back(resClass);
-        } else if(strcmp(className, "Landroid/net/Uri;") == 0) {
-            exemptClzs->push_back(resClass);
+        //if(strcmp(className, "Ljava/util/AbstractMap;") == 0) {
+         //   exemptClzs->push_back(resClass);
+        //} else if(strcmp(className, "Ljava/util/AbstractCollection;") == 0) {
+        //    exemptClzs->push_back(resClass);
+        //} else if(strcmp(className, "Landroid/os/Parcel;") == 0) {
+         //   exemptClzs->push_back(resClass);
+        //} else if(strcmp(className, "Ljava/lang/AbstractStringBuilder;") == 0) {
+        //    exemptClzs->push_back(resClass);
+        //} else if(strcmp(className, "Landroid/os/Bundle;") == 0) {
+        //    exemptClzs->push_back(resClass);
+        //} else if(strcmp(className, "Ljava/io/PrintWriter;") == 0) {
+        //    exemptClzs->push_back(resClass);
+        //} else if(strcmp(className, "Landroid/net/Uri;") == 0) {
+        //    exemptClzs->push_back(resClass);
         //} else if(strcmp(className, "Landroid/content/ContextWrapper;") == 0) {
         //    exemptClzs->push_back(resClass);
-        } else if(strcmp(className, "Landroid/os/Binder;") == 0) {
-            exemptClzs->push_back(resClass);
+       // } else if(strcmp(className, "Landroid/os/Binder;") == 0) {
+         //   exemptClzs->push_back(resClass);
         /*} else if(strcmp(className, "Landroid/view/WindowManager$LayoutParams;") == 0) {
             exemptClzs->push_back(resClass);
         } else if(strcmp(className, "Landroid/view/View;") == 0) {
@@ -391,14 +383,14 @@ void filterExempt(const char* className, ClassObject* resClass) {
             exemptClzs->push_back(resClass);
         } else if(strcmp(className, "Ljava/io/OutputStream;") == 0) {
             exemptClzs->push_back(resClass);*/
-        } else {
+        /*} else {
             for(unsigned int j = 0; j < exemptClzs->size(); j++) {
                 if(dvmInstanceof(resClass, exemptClzs->at(j))) {
                     exemptClzs->push_back(resClass);
                     break;
                 }
             }
-        }
+        }*/
     }
 }
 
@@ -424,7 +416,7 @@ void loadApk(char* apkPath) {
         char* classPath = new char[strlen(bootPath) + strlen(apkPath) + 1];
         strcpy(classPath, bootPath);
         strcat(classPath, apkPath);
-        entry = processClassPath(classPath, false);
+        entry = processClassPath(classPath);
         delete[] classPath;
         while (entry->kind != kCpeLastEntry) {
             DvmDex* pDvmDex;
@@ -528,23 +520,52 @@ void loadApk(char* apkPath) {
             continue;
         }
         // traverse and parse every method in the class, see Object.cpp - findMethodInListByDescriptor
-        Method* methods = resClass->virtualMethods;
-        size_t methodCount = resClass->virtualMethodCount;
-        size_t j;
-        for(j = 0; j < methodCount; j++) {
-            Method* method = &methods[j];
+        Method* vmethods = resClass->virtualMethods;
+        size_t vmethodCount = resClass->virtualMethodCount;
+        for(size_t j = 0; j < vmethodCount; j++) {
+            Method* method = &vmethods[j];
+            if(dvmIsNativeMethod(method)) {
+                continue;
+            }
             ALOGE("start parse method: %s:%s, %u", method->clazz->descriptor, method->name, method->idx);
-            //if(strncmp(method->name, "solve", 5) == 0) {
-            std::vector<Method*>* chain = new std::vector<Method*>();
+            //if(strncmp(method->name, "matrixTest", 5) == 0) {
+            std::set<Method*>* chain = new std::set<Method*>();
             MethodAccInfo* methodAccInfo = parseMethod(method, chain);
             assert(chain->empty());
             for(unsigned int k = 0; k < methodAccInfo->args->size(); k++) {
-                ALOGE("methodParser: for arg %d: ", k);
+            //    ALOGE("methodParser: for arg %d: ", k);
                 depthTraverse(methodAccInfo->args->at(k), 1);
             }
             for(unsigned int k = 0; k < methodAccInfo->globalClazz->size(); k++) {
                 assert(methodAccInfo->globalClazz->at(k) != NULL);
-                ALOGE("methodParser: for clazz %s: ", methodAccInfo->globalClazz->at(k)->clazz->descriptor);
+            //    ALOGE("methodParser: for clazz %s: ", methodAccInfo->globalClazz->at(k)->clazz->descriptor);
+                depthTraverse(methodAccInfo->globalClazz->at(k), 1);
+            }
+            delete chain;
+            //methodResMap.erase(method);
+            //freeMethodAccInfo(methodAccInfo);
+            persistMethodInfo(methodAccInfo, outFileName);
+           //}
+        }
+        Method* dmethods = resClass->directMethods;
+        size_t dmethodCount = resClass->directMethodCount;
+        for(size_t j = 0; j < dmethodCount; j++) {
+            Method* method = &dmethods[j];
+            if(dvmIsNativeMethod(method)) {
+                continue;
+            }
+            ALOGE("start parse method: %s:%s, %u", method->clazz->descriptor, method->name, method->idx);
+            //if(strncmp(method->name, "solve", 5) == 0) {
+            std::set<Method*>* chain = new std::set<Method*>();
+            MethodAccInfo* methodAccInfo = parseMethod(method, chain);
+            assert(chain->empty());
+            for(unsigned int k = 0; k < methodAccInfo->args->size(); k++) {
+              //  ALOGE("methodParser: for arg %d: ", k);
+                depthTraverse(methodAccInfo->args->at(k), 1);
+            }
+            for(unsigned int k = 0; k < methodAccInfo->globalClazz->size(); k++) {
+                assert(methodAccInfo->globalClazz->at(k) != NULL);
+            //    ALOGE("methodParser: for clazz %s: ", methodAccInfo->globalClazz->at(k)->clazz->descriptor);
                 depthTraverse(methodAccInfo->globalClazz->at(k), 1);
             }
             delete chain;
@@ -554,20 +575,20 @@ void loadApk(char* apkPath) {
             //}
         }
     }
-    std::map<char*, MethodAccResult*> methodAccMap;
-    retrieveMethodInfo(&methodAccMap, outFileName);
-    ALOGE("method ACc vec size: %u", methodAccMap.size());
-    for (std::map<char*, MethodAccResult*>::iterator it = methodAccMap.begin(); it != methodAccMap.end(); ++it) {
+    gDvm.methodAccMap = new std::map<char*, MethodAccResult*, charscomp>();
+    retrieveMethodInfo(gDvm.methodAccMap, outFileName);
+    ALOGE("method ACc vec size: %u", gDvm.methodAccMap->size());
+    for (std::map<char*, MethodAccResult*>::iterator it = gDvm.methodAccMap->begin(); it != gDvm.methodAccMap->end(); ++it) {
         MethodAccResult* methodAccResult = it->second;
-        ALOGE("parse result, %s, %s, %d", methodAccResult->clazzDesc, methodAccResult->methodName, methodAccResult->idx);
+        ALOGE("parse result, %s", it->first);
         for(unsigned int j = 0; j < methodAccResult->args->size(); j++) {
-            ALOGE("methodParser: for arg %d: ", j);
+        //    ALOGE("methodParser: for arg %d: ", j);
             depthTraverseResult(methodAccResult->args->at(j), 1);
         }
-        for(unsigned int j = 0; j < methodAccResult->globalClazz->size(); j++) {
-            ALOGE("methodParser: for clazz %s: ", methodAccResult->globalClazz->at(j)->clazz);
+        /*for(unsigned int j = 0; j < methodAccResult->globalClazz->size(); j++) {
+        //    ALOGE("methodParser: for clazz %s: ", methodAccResult->globalClazz->at(j)->clazz);
             depthTraverseResult(methodAccResult->globalClazz->at(j), 1);
-        }
+        }*/
     }
     
 }

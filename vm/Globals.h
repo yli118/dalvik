@@ -43,6 +43,9 @@ struct InlineSub;
 
 struct charscomp {
     bool operator() (const char* lhs, const char* rhs) const {
+        if(lhs == NULL || rhs == NULL) {
+            ALOGE("get one null from either lhs: %p, rhs: %p", lhs, rhs);
+        }
         return strcmp(lhs, rhs) < 0;
     }
 };
@@ -735,6 +738,7 @@ struct DvmGlobals {
     const char *lastMessage;
 
 #ifdef WITH_OFFLOAD
+    u4 changeCount;
     pthread_t       offControlThread;
 
     bool isServer;
@@ -753,6 +757,8 @@ struct DvmGlobals {
     
     // Modified by Yong map which stores the method access information
     std::map<char*, MethodAccResult*, charscomp>* methodAccMap;
+    // Add method execution time cache
+    std::map<const Method*, u8>* methodExeTimeMap;
 
     // offload/Comm.h
     u4 nextId;

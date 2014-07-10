@@ -32,7 +32,7 @@ LOCAL_SHARED_LIBRARIES := $(local_shared_libraries) libcutils libexpat liblog li
 LOCAL_MODULE_TAGS := optional
 LOCAL_MODULE := apkanalysis
 
-LOCAL_C_INCLUDES += external/stlport/stlport bionic/ bionic/libstdc++/include
+LOCAL_C_INCLUDES += bionic/ bionic/libstdc++/include external/stlport/stlport
 LOCAL_SHARED_LIBRARIES += libstlport
 
 include $(BUILD_EXECUTABLE)

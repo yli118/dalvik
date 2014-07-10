@@ -437,8 +437,8 @@ void* offControlLoop(void* junk) {
         strcat(filename, "/parse.txt");
         
         int openfd = open(filename, O_RDONLY, 0664);
-        char buffer[256];
-        bzero(buffer, 256);
+        char buffer[MAX_CONTROL_VPACKET_SIZE];
+        bzero(buffer, MAX_CONTROL_VPACKET_SIZE);
         // the parse result file is not present in server, load it from remote server
         if(openfd == -1) {
             // send a flag to indicate that we need the server to send the data
@@ -453,9 +453,13 @@ void* offControlLoop(void* junk) {
             read(s, reinterpret_cast<char*>(&filesize), sizeof(filesize));
             std::ofstream parsefile(filename, std::ios::binary);
             while(filesize > 0) {
-                read(s, buffer, filesize > 256 ? 256 : filesize);
-                parsefile.write(buffer, filesize > 256 ? 256 : filesize);
-                filesize = (filesize > 256) ? filesize - 256 : 0;
+                int readresult = read(s, buffer, filesize > MAX_CONTROL_VPACKET_SIZE ? MAX_CONTROL_VPACKET_SIZE : filesize);
+                if(readresult < 0) {
+                    ALOGE("control recieve error data");
+                    continue;
+                }
+                parsefile.write(buffer, filesize > MAX_CONTROL_VPACKET_SIZE ? MAX_CONTROL_VPACKET_SIZE : filesize);
+                filesize = (filesize > MAX_CONTROL_VPACKET_SIZE) ? filesize - MAX_CONTROL_VPACKET_SIZE : 0;
             }
             parsefile.close();
         } else {
@@ -463,18 +467,11 @@ void* offControlLoop(void* junk) {
             write(s, buffer, 1);
             close(openfd);
         }
-        retrieveMethodInfo(&gDvm.methodAccMap, filename);
-    /*ALOGE("methodParser ACc vec size: %u", methodAccVec.size());
-    for(unsigned int i = 0; i < methodAccVec.size(); i++) {
-        ALOGE("methodParser parse result, %s, %s, %d", methodAccVec[i]->clazzDesc, methodAccVec[i]->methodName, methodAccVec[i]->idx);
-        for(unsigned int j = 0; j < methodAccVec[i]->args->size(); j++) {
-            ALOGE("methodParser: for arg %d: ", j);
-            depthTraverseResult(methodAccVec[i]->args->at(j), 1);
-        }
-    }*/
+        gDvm.methodAccMap = new std::map<char*, MethodAccResult*, charscomp>();
+        retrieveMethodInfo(gDvm.methodAccMap, filename);
     } else {
-        char buffer[256];
-        bzero(buffer, 256);
+        char buffer[MAX_CONTROL_VPACKET_SIZE];
+        bzero(buffer, MAX_CONTROL_VPACKET_SIZE);
         read(s, buffer, 1);
         if(buffer[0] == '1') {
             char* BASE_PATH = getenv("OFFLOAD_PARSE_CACHE");
@@ -495,18 +492,18 @@ void* offControlLoop(void* junk) {
             parsefile.seekg(0, std::ios::beg);
             begin = parsefile.tellg();
             long filesize = (end - begin);
-            ALOGE("control the server file path is: %s, file size is: %d", filename, (int) filesize);
+            ALOGI("control the server file path is: %s, file size is: %d", filename, (int) filesize);
             // write out the size of the file
             write(s, reinterpret_cast<char*>(&filesize), sizeof(filesize));
             // write out the actual content of the file
-            while(parsefile.read(buffer, 256)) {
-                write(s, buffer, 256);
+            while(parsefile.read(buffer, MAX_CONTROL_VPACKET_SIZE)) {
+                while(write(s, buffer, MAX_CONTROL_VPACKET_SIZE) < 0);
             }
             // process the last read result
-            write(s, buffer, parsefile.gcount());
+            while(write(s, buffer, parsefile.gcount()) < 0);
             parsefile.close();
         } else {
-            ALOGE("control server no need file pull");
+            ALOGI("control server no need file pull");
         }
     }
     // Modified end
@@ -679,6 +676,7 @@ bool offControlStartup(int afterZygote) {
 
     const char* env_server = getenv("OFF_SERVER");
     gDvm.isServer = env_server && !strcmp("1", env_server);
+    gDvm.methodExeTimeMap = new std::map<const Method*, u8>();
 
     res = offThreadingStartup() &&
           offDexLoaderStartup() && offCommStartup() &&
