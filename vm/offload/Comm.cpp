@@ -1,5 +1,6 @@
 #include "Dalvik.h"
 #include "alloc/HeapInternal.h"
+#include <sstream> 
 
 #include <sys/time.h>
 
@@ -9,11 +10,11 @@
   struct timeval _end_time_;                                                \
   gettimeofday(&_start_time_, NULL)
 
-#define TIMER_END(name, bytes, fields)                                      \
+#define TIMER_END(threadId, name, bytes, fields)                                      \
   gettimeofday(&_end_time_, NULL);                                          \
   _end_time_us_ = (_end_time_.tv_sec - _start_time_.tv_sec) * 1000000 +     \
                      (_end_time_.tv_usec - _start_time_.tv_usec);           \
-  ALOGI("TIMER %s %lld.%06lld [%d bytes, %d fields]", name,                 \
+  ALOGI("THREAD %d TIMER %s %lld.%06lld [%d bytes, %d fields]", threadId, name,                 \
         _end_time_us_ / 1000000, _end_time_us_ % 1000000,                   \
         (bytes), (fields))
 
@@ -87,6 +88,9 @@ void offAddTrackedObject(Object* obj) {
   } else if(obj->objId == COMM_INVALID_ID) {
     /* Otherwise we do the normal process of allocating an object identifier and
      * setting up a data structure for it. */
+    if(isClassObject(obj) && ((ClassObject*)obj)->super == gDvm.classJavaLangReflectProxy) {
+        ALOGE("write Proxy object id");
+    }
     pthread_mutex_lock(&gDvm.offCommLock);
     while(!addTrackedObjectIdLocked(obj, ADD_ID_MASK(gDvm.nextId++)));
 
@@ -358,10 +362,13 @@ static void clearDirty(ObjectInfo* info, u4 fieldIndex) {
   }
 }
 
-/*static*/ int addClazzReachableObj(ClassObject* clazz, void* arg) {
+static int addClazzReachableObj(ClassObject* clazz, void* arg) {
   UNUSED_PARAMETER(arg);
   if(clazz->status < CLASS_INITIALIZING) {
     return 0;
+  }
+   if(clazz->super == gDvm.classJavaLangReflectProxy) {
+    ALOGE("find proxy class in the hash map, clazz is: %s, id is: %d, status is: %d", clazz->descriptor, clazz->objId, clazz->status);
   }
   offAddObjectIntoTrack(clazz, NULL);
   return 0;
@@ -402,9 +409,11 @@ static void writeValue(FifoBuffer* fb, char type, JValue* val) {
         assert(objId != COMM_INVALID_ID);
 
         writeU4(fb, auxObjectToId((Object*)obj->clazz));
-        //ALOGE("write object clazz id: %d, descriptor: %s", auxObjectToId((Object*)obj->clazz), obj->clazz->descriptor);
         writeU4(fb, objId);
-        //ALOGE("write object instance id: %d", objId);
+        if(isClassObject(obj)) {        
+            ALOGE("write object clazz id: %d, descriptor: %s", auxObjectToId((Object*)obj->clazz), obj->clazz->descriptor);
+            ALOGE("write object instance id: %d, descriptor: %s", objId, ((ClassObject*)obj)->descriptor);
+        }
         if(*obj->clazz->descriptor == '[') {
           ArrayObject* aobj = (ArrayObject*)obj;
           writeU4(fb, aobj->length);
@@ -429,18 +438,22 @@ static void readValue(Thread* self, FifoBuffer* fb, char type,
     case 'D': case 'J': val->j = readU8(fb); break;
     case '[': case 'L': {
       u4 clId = readU4(fb);
-      //ALOGE("read object clazz id: %d", clId);
       if(clId == COMM_INVALID_ID) {
         val->l = NULL;
       } else {
         ClassObject* clazz = (ClassObject*)offIdToObject(clId);
         assert(clazz->clazz == gDvm.classJavaLangClass);
         u4 objId = readU4(fb);
-        //ALOGE("read object instance id: %d, , descriptor: %s", objId, clazz->descriptor);
         u4 arrLength = *clazz->descriptor == '[' ? readU4(fb) : 0;
-        //ALOGE("read array instance length: %d", arrLength);
+        /*if(*clazz->descriptor == '[') {
+        ALOGE("read array instance length: %d, class descriptor: %s, clId is: %d", arrLength, clazz->descriptor, clId);
+        }*/
 
         Object* obj = offIdToObject(objId);
+        /*if(isClassObject(obj)) {
+            ALOGE("read object clazz id: %d", clId);
+            ALOGE("read object instance id: %d, , descriptor: %s", objId, ((ClassObject*)obj)->descriptor);
+        }*/
         if(obj == NULL) {
           if(*clazz->descriptor == '[') {
             obj = (Object*)dvmAllocArrayByClass(clazz, arrLength,
@@ -456,6 +469,9 @@ static void readValue(Thread* self, FifoBuffer* fb, char type,
           dvmReleaseTrackedAlloc(obj, self);
         }
         assert(obj && "failed to allocate object");
+        if(isClassObject(obj) && ((ClassObject*)obj)->status == 0) {
+            ALOGE("find an error obj with a wrong state, clid: %u, cl descriptor: %s, cl state: %d", objId, ((ClassObject*)obj)->descriptor, ((ClassObject*)obj)->status);
+        }
         val->l = obj;
       }
     } break;
@@ -516,6 +532,17 @@ void expandProxies(FifoBuffer* fb) {
   }
 }
 
+static int scanstatic(ClassObject* clazz, void* arg) {
+  UNUSED_PARAMETER(arg);
+  if(clazz->status < CLASS_INITIALIZING) {
+    return 0;
+  }
+   if(clazz->super == gDvm.classJavaLangReflectProxy) {
+    ALOGE("find proxy class in the hash map in the first scan static, clazz is: %s, id is: %d, status is: %d", clazz->descriptor, clazz->objId, clazz->status);
+  }
+  return 0;
+}
+
 void offSyncPush() {
   offSyncPushDoIf(NULL, NULL, NULL, NULL);
 }
@@ -532,6 +559,14 @@ void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
     return;
   }
 
+  if(!gDvm.isServer) {
+    /* add static class reachable object into write queue */
+    u8 starttime = dvmGetRelativeTimeUsec();
+    dvmHashForeach(gDvm.loadedClasses, (HashForeachFunc)scanstatic, NULL);
+    u8 endtime = dvmGetRelativeTimeUsec();
+    ALOGE("sync scan static class time: %llu, scaned class: %d", endtime - starttime, gDvm.loadedClasses->numEntries);
+  }
+  
   /* Send revision header. */
   offWriteU4(self, gDvm.offSendRevision++);
 
@@ -552,7 +587,7 @@ void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
     u8 starttime = dvmGetRelativeTimeUsec();
     dvmHashForeach(gDvm.loadedClasses, (HashForeachFunc)addClazzReachableObj, NULL);
     u8 endtime = dvmGetRelativeTimeUsec();
-    ALOGE("sync scan class time: %llu", endtime - starttime);
+    ALOGE("sync scan class time: %llu, scaned class: %d", endtime - starttime, gDvm.loadedClasses->numEntries);
   }
 
     u8 starttime = dvmGetRelativeTimeUsec();
@@ -561,16 +596,20 @@ void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
   offPushAllStacks(&sfb);
 
   /* Send over new class status updates. */
-  //ALOGI("gDvm.offStatusUpdate size is: %u", auxVectorSize(&gDvm.offStatusUpdate));
+  ALOGI("gDvm.offStatusUpdate size is: %u", auxVectorSize(&gDvm.offStatusUpdate));
   for(j = 0; j < auxVectorSize(&gDvm.offStatusUpdate); j++) {
     ClassObject* clazz = (ClassObject*)auxVectorGet(&gDvm.offStatusUpdate, j).l;
     //ALOGE("offloading send: clazz id: %d, clazz name: %s", clazz->objId, clazz->descriptor);
+    if(clazz->super == gDvm.classJavaLangReflectProxy) {
+        continue;
+    }
 
     JValue valobj; valobj.l = clazz;
     writeValue(&fb, 'L', &valobj);
     writeU4(&fb, (u4)clazz->status);
     writeU4(&fb, (u4)clazz->initThreadId);
   }
+  ALOGI("after gDvm.offStatusUpdate size is: %u", auxVectorSize(&gDvm.offStatusUpdate));
   auxVectorResize(&gDvm.offStatusUpdate, 0);
   JValue valobj; valobj.l = NULL;
   writeValue(&fb, 'L', &valobj);
@@ -719,17 +758,28 @@ void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
    */
   u4 total_bytes = auxFifoSize(&fb) + auxFifoSize(&sfb);
   offWriteU4(self, total_bytes);
+  char* filename = new char[50];
+  std::stringstream converter;
+  converter << self->threadId;
+  strcpy(filename, "/data/tmp/");
+  strcat(filename, converter.str().c_str());
+  strcat(filename, ".txt");
+  std::ofstream writefile(filename, std::ios::binary | std::ios::app);
   while(!auxFifoEmpty(&fb)) {
     u4 bytes = auxFifoGetBufferSize(&fb);
     offSendMessage(self, auxFifoGetBuffer(&fb), bytes);
+    writefile.write(auxFifoGetBuffer(&fb), bytes);
     auxFifoPopBytes(&fb, bytes);
   }
   auxFifoDestroy(&fb);
   while(!auxFifoEmpty(&sfb)) {
     u4 bytes = auxFifoGetBufferSize(&sfb);
     offSendMessage(self, auxFifoGetBuffer(&sfb), bytes);
+    writefile.write(auxFifoGetBuffer(&sfb), bytes);
     auxFifoPopBytes(&sfb, bytes);
   }
+  writefile.close();
+  delete[] filename;
   auxFifoDestroy(&sfb);
     u8 endtime = dvmGetRelativeTimeUsec();
     ALOGE("sync send data time: %llu", endtime - starttime);
@@ -741,7 +791,7 @@ void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
 
   /* Wait for the sync to complete. */
   offThreadWaitForResume(self);
-  TIMER_END("syncPush", total_bytes, dirty_fields);
+  TIMER_END(self->threadId, "syncPush", total_bytes, dirty_fields);
   if(gDvm.offSyncTime == 0) {
     gDvm.offSyncTime = _end_time_us_;
   } else {
@@ -783,16 +833,26 @@ bool offSyncPullDo(void(*before_func)(void*), void* before_arg,
   FifoBuffer fb = auxFifoCreate();
   bytes = offReadU4(self);
   if(!gDvm.offConnected) return false;
+  char* filename = new char[50];
+  std::stringstream converter;
+  converter << self->threadId;
+  strcpy(filename, "/data/tmp/");
+  strcat(filename, converter.str().c_str());
+  strcat(filename, ".txt");
+  std::ofstream writefile(filename, std::ios::binary | std::ios::app);
   while(bytes > 0) {
     char cbuf[1024];
     u4 rbytes = bytes < sizeof(cbuf) ? bytes : sizeof(cbuf);
     offReadBuffer(self, cbuf, rbytes);
     auxFifoPushData(&fb, cbuf, rbytes);
+    writefile.write(cbuf, rbytes);
     bytes -= rbytes;
   }
+  delete[] filename;
+  writefile.close();
 
   u4 total_bytes = auxFifoSize(&fbproxy) + auxFifoSize(&fb);
-  TIMER_END("syncPull [read]", total_bytes, 0);
+  TIMER_END(self->threadId, "syncPull [read]", total_bytes, 0);
 
   /* Load in any dex files.  Usually there is nothing to do here.  This should
    * happen prior to any thread suspension. */
@@ -931,7 +991,7 @@ bool offSyncPullDo(void(*before_func)(void*), void* before_arg,
   auxFifoDestroy(&fb);
 
   offWriteU1(self, OFF_ACTION_RESUME);
-  TIMER_END("syncPull", total_bytes, dirtyCount);
+  TIMER_END(self->threadId, "syncPull", total_bytes, dirtyCount);
 
   pthread_mutex_lock(&gDvm.offCommLock);
   gDvm.offRecvRevision++;
