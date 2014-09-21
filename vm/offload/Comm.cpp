@@ -21,8 +21,28 @@
 #define TIMER_RESET() \
   gettimeofday(&_start_time_, NULL)
 
+#define READWRITEFUNC(type, size, ntoh, hton)                                 \
+  static void write##size(FifoBuffer* fb, type v) {                           \
+    v = hton(v);                                                              \
+    auxFifoPushData(fb, (char*)&v, sizeof(v));                                \
+  }                                                                           \
+  static type read##size(FifoBuffer* fb) {                                    \
+    type v;                                                                   \
+    auxFifoReadBuffer(fb, (char*)&v, sizeof(v));                              \
+    return ntoh(v);                                                           \
+  }
+
+READWRITEFUNC(u1, U1, , );
+READWRITEFUNC(u2, U2, ntohs, htons);
+READWRITEFUNC(u4, U4, ntohl, htonl);
+READWRITEFUNC(u8, U8, ntohll, htonll);
+
+static std::stringstream converter;
+extern std::ifstream staticfile;
+
 static bool isObjectDirty(ObjectInfo* info);
 static bool isFieldDirty(ObjectInfo* info, u4 fieldIndex);
+static void writeValue(FifoBuffer* fb, char type, JValue* val);
   
 static bool isClassObject(Object* obj) {
   return obj->clazz == gDvm.classJavaLangClass;
@@ -91,9 +111,6 @@ void offAddTrackedObject(Object* obj) {
   } else if(obj->objId == COMM_INVALID_ID) {
     /* Otherwise we do the normal process of allocating an object identifier and
      * setting up a data structure for it. */
-    if(isClassObject(obj) && ((ClassObject*)obj)->super == gDvm.classJavaLangReflectProxy) {
-        ALOGE("write Proxy object id");
-    }
     pthread_mutex_lock(&gDvm.offCommLock);
     while(!addTrackedObjectIdLocked(obj, ADD_ID_MASK(gDvm.nextId++)));
 
@@ -111,7 +128,129 @@ void offAddTrackedObject(Object* obj) {
   }
 }
 
-void offAddObjectIntoTrack(Object* objToAdd, ObjectAccResult* objAccInfoToAdd, bool isClassReachable) {
+void offAddVectorIntoTrack(std::vector<Object*>* objVec, FifoBuffer* fb) {
+  for(unsigned int i = 0; i < objVec->size(); i++) {
+    Object* obj = objVec->at(i);
+    if(obj->objId == COMM_INVALID_ID) {
+      pthread_mutex_lock(&gDvm.offCommLock);
+      while(!addTrackedObjectIdLocked(obj, ADD_ID_MASK(gDvm.nextId++)));
+
+      u4 maxField = getMaxFieldIndex(obj);
+      ObjectInfo* info = offIdObjectInfo(obj->objId);
+      memset(&info->dirty, 0xFF, sizeof(info->dirty));
+      if(maxField > 32) {
+        memset(info->bits, 0xFF, ((maxField - 1) >> 5) << 2);
+      }
+
+      pthread_mutex_unlock(&gDvm.offCommLock);
+    }
+    ObjectInfo* info = offIdObjectInfo(obj->objId);
+    // it has been marked as migrate all before, do not need to handle it again
+    if(info->isQueued) {
+      continue;
+    }
+    if(!info->isQueued) {
+      pthread_mutex_lock(&gDvm.offCommLock);
+      info->isQueued = true;
+      offAddToWriteQueueLocked(obj);
+      pthread_mutex_unlock(&gDvm.offCommLock);
+    }
+    bool isDirty = isObjectDirty(info);
+    u4 maxIndex;
+    if(isDirty) {
+      // write object info
+      /* Write the object definition. */
+      JValue valobj; valobj.l = obj;
+      writeValue(fb, 'L', &valobj);  
+          
+      /* Write the dirty bits. */
+      maxIndex = getMaxFieldIndex(obj);
+      writeU4(fb, info->dirty);
+      //ALOGE("offloading send: object id: %d, dirty: %u", obj->objId, info->dirty);
+      if(maxIndex > 32) {
+        u4 bsz = (maxIndex - 1) >> 5;
+        for(u4 j = 0; j < bsz; j++) {
+          writeU4(fb, info->bits[j]);
+          //ALOGE("offloading send: object id: %d, dirty bits j: %d, value: %u", obj->objId, j, info->bits[j]);
+        }
+      }
+    }
+    if(isClassObject(obj)) {
+      /* To sync class objects we just write out all of its globals. */
+      ClassObject* clazz = (ClassObject*)obj;
+
+      StaticField* fld = clazz->sfields;
+      StaticField* efld = fld + clazz->sfieldCount;
+      for(; fld != efld; ++fld) {
+        if(isFieldDirty(info, fld - clazz->sfields)) {
+          writeValue(fb, *fld->signature, (JValue*)&fld->value);
+        }
+        if(*fld->signature != '[' && *fld->signature != 'L') {
+          continue;
+        }
+        JValue* val = &fld->value;
+        Object* fldObj = (Object*) val->l;
+        if(fldObj != NULL) {
+          objVec->push_back(fldObj);
+        }
+      }
+    } else {
+      ClassObject* clazz = obj->clazz;
+      if(*clazz->descriptor != '[') {
+        /* For normal class objects we write out all the instance fields. */
+        for(; clazz; clazz = clazz->super) {
+          InstField* fld = clazz->ifields;
+          InstField* efld = fld + clazz->ifieldCount;
+          for(; fld != efld; ++fld) {
+            if(isFieldDirty(info, (fld->byteOffset - sizeof(Object)) >> 2)) {
+              writeValue(fb, *fld->signature,
+                       (JValue*)(((char*)obj) + fld->byteOffset));
+            }
+            if(*fld->signature != '[' && *fld->signature != 'L') {
+              continue;
+            }
+            JValue* val = (JValue*) ((char*)obj + fld->byteOffset);
+            Object* fldObj = (Object*) val->l;
+            if(fldObj != NULL) {
+              objVec->push_back(fldObj);
+            }
+          }
+        }
+      } else {
+        /* For array objects we send the whole array contents for now. */
+        ArrayObject* aobj = (ArrayObject*)obj;
+        char* contents = (char*)aobj->contents;
+        char type = aobj->clazz->descriptor[1];
+        u4 typeWidth = auxTypeWidth(type);
+        for(u4 j = 0; j < aobj->length; j++, contents += typeWidth) {
+          if(isFieldDirty(info, j)) {
+            writeValue(fb, aobj->clazz->descriptor[1], (JValue*)contents);
+          }
+          if(type != '[' && type != 'L') {
+            continue;
+          }
+          JValue* val = (JValue*) contents;
+          Object* fldObj = (Object*) val->l;
+          if(fldObj != NULL) {
+            objVec->push_back(fldObj);
+          }
+        }
+      }
+    }
+    if(isDirty) {
+        info->dirty = 0;
+        u4 maxIndex = getMaxFieldIndex(obj);
+        if(maxIndex > 32) {
+          u4 bsz = (maxIndex - 1) >> 5;
+          for(u4 j = 0; j < bsz; j++) {
+            info->bits[j] = 0;
+          }
+        }
+      }
+    }
+}
+
+void offAddObjectIntoTrack(Object* objToAdd, ObjectAccResult* objAccInfoToAdd, FifoBuffer* fb) {
   if(objToAdd == NULL) {
     return;
   }
@@ -143,50 +282,47 @@ void offAddObjectIntoTrack(Object* objToAdd, ObjectAccResult* objAccInfoToAdd, b
     }
     ObjectInfo* info = offIdObjectInfo(obj->objId);
     // it has been marked as migrate all before, do not need to handle it again
-    if(info->allFlag || info->isQueued || info->isClassReachable) {
+    if(info->isQueued) {
       continue;
     }
-    if(isClassReachable) {
-      info->isClassReachable = true;
-    }
-    if(!objAccInfo->allFlag) { // this indicates we need to migrate all the information
-      if(isObjectDirty(info)) {
-        if(!info->isQueued) {
-          pthread_mutex_lock(&gDvm.offCommLock);
-          info->isQueued = true;
-          offAddToWriteQueueLocked(obj);
-          pthread_mutex_unlock(&gDvm.offCommLock);
-          info->allFlag = objAccInfo->allFlag;
-          info->migrate = objAccInfo->migrate;
-          u4 maxFields = getMaxFieldIndex(obj);
-          u4 fsz = (maxFields - 1) >> 5;
-          info->highbits = maxFields > 32 ? (u4*)calloc(fsz, 4) : (u4*)NULL;
-          if(info->highbits != NULL && objAccInfo->highbits != NULL) {
-            u4 asz = (objAccInfo->fieldSet.size() - 1) >> 5;
-            memcpy(info->highbits, objAccInfo->highbits, (fsz < asz ? fsz : asz) << 2);
-          }
-        } else {
-          info->allFlag = info->allFlag | objAccInfo->allFlag;
-          info->migrate = info->migrate | objAccInfo->migrate;
-          u4 maxFields = getMaxFieldIndex(obj);
-          u4 fsz = (maxFields - 1) >> 5;
-          if(info->highbits != NULL && objAccInfo->highbits != NULL) {
-            u4 asz = (objAccInfo->fieldSet.size() - 1) >> 5;
-            for(u4 i = 0; i < (fsz < asz ? fsz : asz); i++) {
-              *(info->highbits + i) = *(info->highbits + i) | *(objAccInfo->highbits + i);
+    if(!objAccInfo->allFlag) { // this indicates we don't need to migrate all the information
+      bool isDirty = isObjectDirty(info);
+      u4 maxIndex = 0;
+      if(isDirty) {
+        // write object info
+        /* Write the object definition. */
+        JValue valobj; valobj.l = obj;
+        writeValue(fb, 'L', &valobj);  
+          
+        /* Write the dirty bits. */
+        maxIndex = getMaxFieldIndex(obj);
+        writeU4(fb, info->dirty & objAccInfo->migrate);
+        //ALOGE("offloading send: object id: %d, dirty: %u", obj->objId, info->dirty & info->migrate);
+        if(maxIndex > 32) {
+          u4 bsz = (maxIndex - 1) >> 5;
+          u4 asz = (objAccInfo->fieldSet.size() - 1) >> 5;
+          for(u4 j = 0; j < bsz; j++) {
+            if(j < asz) {
+              writeU4(fb, info->bits[j] & objAccInfo->highbits[j]);
+            } else {
+              writeU4(fb, 0);
             }
+            //ALOGE("offloading send: object id: %d, dirty bits j: %d, value: %u", obj->objId, j, info->bits[j] & info->highbits[j]);
           }
         }
       }
       if(isClassObject(obj)) {
         /* To sync class objects we just write out all of its globals. */
         ClassObject* clazz = (ClassObject*)obj;
-
+        
         StaticField* fld = clazz->sfields;
         unsigned int count = ((unsigned int) clazz->sfieldCount < objAccInfo->fieldSet.size()) ? clazz->sfieldCount : objAccInfo->fieldSet.size();
         for(unsigned int offset = 0; offset < count; offset++, ++fld) {
           if(objAccInfo->fieldSet[offset] == NULL) {
             continue;
+          }
+          if(isFieldDirty(info, fld - clazz->sfields)) {
+            writeValue(fb, *fld->signature, (JValue*)&fld->value);
           }
           if(*fld->signature != '[' && *fld->signature != 'L') {
             continue;
@@ -206,17 +342,22 @@ void offAddObjectIntoTrack(Object* objToAdd, ObjectAccResult* objAccInfoToAdd, b
             InstField* fld = clazz->ifields;
             InstField* efld = fld + clazz->ifieldCount;
             for(; fld != efld; ++fld) {
+              unsigned int offset = (fld->byteOffset - sizeof(Object)) >> 2;
+              if(objAccInfo->fieldSet.size() <= offset || objAccInfo->fieldSet[offset] == NULL) {
+                continue;
+              }
+              if(isFieldDirty(info, (fld->byteOffset - sizeof(Object)) >> 2)) {
+                writeValue(fb, *fld->signature,
+                         (JValue*)(((char*)obj) + fld->byteOffset));
+              }
               if(*fld->signature != '[' && *fld->signature != 'L') {
                 continue;
               }
               JValue* val = (JValue*) ((char*)obj + fld->byteOffset);
               Object* fldObj = (Object*) val->l;
               if(fldObj != NULL) {
-                unsigned int offset = (fld->byteOffset - sizeof(Object)) >> 2;
-                if(objAccInfo->fieldSet.size() > offset && objAccInfo->fieldSet[offset] != NULL) {
-                  objVec.push_back(fldObj);
-                  objAccVec.push_back(objAccInfo->fieldSet[offset]);
-                }
+                objVec.push_back(fldObj);
+                objAccVec.push_back(objAccInfo->fieldSet[offset]);
               }
             }
           }
@@ -227,14 +368,16 @@ void offAddObjectIntoTrack(Object* objToAdd, ObjectAccResult* objAccInfoToAdd, b
           }
           /* For array objects we send the whole array contents for now. */
           ArrayObject* aobj = (ArrayObject*)obj;
-          char type = aobj->clazz->descriptor[1];
-          if(type != '[' && type != 'L') {
-            continue;
-          }
           char* contents = (char*)aobj->contents;
-
+          char type = aobj->clazz->descriptor[1];
           u4 typeWidth = auxTypeWidth(type);
-          for(u4 i = 0; i < aobj->length; i++, contents += typeWidth) {
+          for(u4 j = 0; j < aobj->length; j++, contents += typeWidth) {
+            if(isFieldDirty(info, j)) {
+              writeValue(fb, aobj->clazz->descriptor[1], (JValue*)contents);
+            }
+            if(type != '[' && type != 'L') {
+              continue;
+            }
             JValue* val = (JValue*) contents;
             Object* fldObj = (Object*) val->l;
             if(fldObj != NULL) {
@@ -244,14 +387,44 @@ void offAddObjectIntoTrack(Object* objToAdd, ObjectAccResult* objAccInfoToAdd, b
           }
         }
       }
+      if(isDirty) {
+        info->dirty = info->dirty & ~objAccInfo->migrate;
+        if(maxIndex > 32) {
+          u4 maxIndex = getMaxFieldIndex(obj);
+          u4 bsz = (maxIndex - 1) >> 5;
+          u4 asz = (objAccInfo->fieldSet.size() - 1) >> 5;
+          for(u4 j = 0; j < bsz; j++) {
+            if(j < asz) {
+              info->bits[j] = info->bits[j] & ~objAccInfo->highbits[j];
+            }
+          }
+        }
+      }
     } else {
-      if(isObjectDirty(info)) {
-        info->allFlag = true;
-        if(!info->isQueued) {
-          pthread_mutex_lock(&gDvm.offCommLock);
-          info->isQueued = true;
-          offAddToWriteQueueLocked(obj);
-          pthread_mutex_unlock(&gDvm.offCommLock);
+      if(!info->isQueued) {
+        pthread_mutex_lock(&gDvm.offCommLock);
+        info->isQueued = true;
+        offAddToWriteQueueLocked(obj);
+        pthread_mutex_unlock(&gDvm.offCommLock);
+      }
+      bool isDirty = isObjectDirty(info);
+      u4 maxIndex = 0;
+      if(isDirty) {
+        // write object info
+        /* Write the object definition. */
+        JValue valobj; valobj.l = obj;
+        writeValue(fb, 'L', &valobj);  
+          
+        /* Write the dirty bits. */
+        maxIndex = getMaxFieldIndex(obj);
+        writeU4(fb, info->dirty);
+        //ALOGE("offloading send: object id: %d, dirty: %u", obj->objId, info->dirty);
+        if(maxIndex > 32) {
+          u4 bsz = (maxIndex - 1) >> 5;
+          for(u4 j = 0; j < bsz; j++) {
+            writeU4(fb, info->bits[j]);
+            //ALOGE("offloading send: object id: %d, dirty bits j: %d, value: %u", obj->objId, j, info->bits[j]);
+          }
         }
       }
       if(isClassObject(obj)) {
@@ -261,6 +434,9 @@ void offAddObjectIntoTrack(Object* objToAdd, ObjectAccResult* objAccInfoToAdd, b
         StaticField* fld = clazz->sfields;
         StaticField* efld = fld + clazz->sfieldCount;
         for(; fld != efld; ++fld) {
+          if(isFieldDirty(info, fld - clazz->sfields)) {
+            writeValue(fb, *fld->signature, (JValue*)&fld->value);
+          }
           if(*fld->signature != '[' && *fld->signature != 'L') {
             continue;
           }
@@ -279,6 +455,10 @@ void offAddObjectIntoTrack(Object* objToAdd, ObjectAccResult* objAccInfoToAdd, b
             InstField* fld = clazz->ifields;
             InstField* efld = fld + clazz->ifieldCount;
             for(; fld != efld; ++fld) {
+              if(isFieldDirty(info, (fld->byteOffset - sizeof(Object)) >> 2)) {
+                writeValue(fb, *fld->signature,
+                         (JValue*)(((char*)obj) + fld->byteOffset));
+              }
               if(*fld->signature != '[' && *fld->signature != 'L') {
                 continue;
               }
@@ -291,20 +471,18 @@ void offAddObjectIntoTrack(Object* objToAdd, ObjectAccResult* objAccInfoToAdd, b
             }
           }
         } else {
-          // For array, the static analysis will only treat it as migrate all or not migrate
-          if(!objAccInfo->allFlag) {
-            continue;
-          }
           /* For array objects we send the whole array contents for now. */
           ArrayObject* aobj = (ArrayObject*)obj;
-          char type = aobj->clazz->descriptor[1];
-          if(type != '[' && type != 'L') {
-            continue;
-          }
           char* contents = (char*)aobj->contents;
-
+          char type = aobj->clazz->descriptor[1];
           u4 typeWidth = auxTypeWidth(type);
-          for(u4 i = 0; i < aobj->length; i++, contents += typeWidth) {
+          for(u4 j = 0; j < aobj->length; j++, contents += typeWidth) {
+            if(isFieldDirty(info, j)) {
+              writeValue(fb, aobj->clazz->descriptor[1], (JValue*)contents);
+            }
+            if(type != '[' && type != 'L') {
+              continue;
+            }
             JValue* val = (JValue*) contents;
             Object* fldObj = (Object*) val->l;
             if(fldObj != NULL) {
@@ -314,92 +492,181 @@ void offAddObjectIntoTrack(Object* objToAdd, ObjectAccResult* objAccInfoToAdd, b
           }
         }
       }
+      if(isDirty) {
+        info->dirty = 0;
+        if(maxIndex > 32) {
+          u4 bsz = (maxIndex - 1) >> 5;
+          for(u4 j = 0; j < bsz; j++) {
+            info->bits[j] = 0;
+          }
+        }
+      }
     }
   }
 }
 
-static void addClazzReachableObj() { 
-  for(u4 i = 0; i < auxVectorSize(&gDvm.offClassReachableQueue); i++) {
-    Object* obj = (ClassObject*)auxVectorGet(&gDvm.offClassReachableQueue, i).l;
-    ALOGE("changing class: %s, its id: %d", isClassObject(obj) ? ((ClassObject*)obj)->descriptor : obj->clazz->descriptor, obj->objId);
-    pthread_mutex_lock(&gDvm.offCommLock);
-    offAddToWriteQueueLocked(obj);
-    pthread_mutex_unlock(&gDvm.offCommLock);
-    ObjectInfo* info = offIdObjectInfo(obj->objId);
-    info->allFlag = true;
-    // we add all the dirty objects to the write queue and flags them as class reachable
-    if(isClassObject(obj)) {
-      ClassObject* clazz = (ClassObject*)obj;
+static int addClazzReachableObj(ClassObject* clazz, void* vfb) {
+  if(clazz->status < CLASS_INITIALIZING) {
+    return 0;
+  }
+  FifoBuffer* fb = (FifoBuffer*) vfb;
+  offAddObjectIntoTrack(clazz, NULL, fb);
+  return 0;
+}
+
+void pushAllClazzInfo(FifoBuffer* fb) {
+  //u8 starttime = dvmGetRelativeTimeUsec();
+  dvmHashForeach(gDvm.loadedClasses, (HashForeachFunc)addClazzReachableObj, fb);
+  //u8 endtime = dvmGetRelativeTimeUsec();
+  //ALOGE("sync scan class time with scan loaded classes is: %llu", endtime-starttime);
+}
+
+void pushClazzInfo(const Method* method, char* key, FifoBuffer* fb) {
+  if(gDvm.methodClzOffsetMap->find(key) == gDvm.methodClzOffsetMap->end()) {
+   // ALOGE("sync scan class cannot find the specified key, the key is: %s", key);
+    pushAllClazzInfo(fb);
+    return;
+  }
+  //u8 starttime = dvmGetRelativeTimeUsec();
+  //u4 classCount = 0;
+  //u4 actualCount = 0;
+  ClassObject* classLoaderClazz = dvmFindSystemClass("Ljava/lang/ClassLoader;");
+  InstField* fld,* efld;
+  int byteOffset = 0;
+  for(fld = classLoaderClazz->ifields, efld = classLoaderClazz->ifields +
+    classLoaderClazz->ifieldCount; fld != efld; ++fld) {
+    if(!strcmp("parent", fld->name)) {
+      byteOffset = fld->byteOffset;
+      break;
+    }
+  }
+  //u4 timeusedforfile = 0;
+  //u4 timeusedforparse = 0;
+  //u4 timeusedforadd = 0;
+  //u8 fstart = dvmGetRelativeTimeUsec();
+  staticfile.seekg((*gDvm.methodClzOffsetMap)[key]);
+  std::string line;
+  // read the method name info
+  std::getline(staticfile, line);
+  //u8 fend = dvmGetRelativeTimeUsec();
+ // timeusedforfile+= fend-fstart;
+  std::vector<Object*>* objVec = new std::vector<Object*>();
+  while(true) {
+    //classCount++;
+ // u8 fstart = dvmGetRelativeTimeUsec();
+    std::getline(staticfile, line);
+ // u8 fend = dvmGetRelativeTimeUsec();
+  //timeusedforfile+= fend-fstart;
+    if(line.compare("") == 0) {
+      break;
+    }
+    Object* classLoader = method->clazz->classLoader;
+    ClassObject* clazz;
+    do {
+      clazz = dvmLookupClass(line.c_str(), classLoader, false);
+      if(classLoader == NULL) {
+        break;
+      }
+      JValue* val = (JValue*) ((char*)classLoader + byteOffset);
+      classLoader = (Object*) val->l;
+    } while(clazz == NULL);
+  //fstart = dvmGetRelativeTimeUsec();
+    std::getline(staticfile, line);
+  //fend = dvmGetRelativeTimeUsec();
+  //timeusedforfile+= fend-fstart;
+ // u8 pstart = dvmGetRelativeTimeUsec();
+    if(clazz != NULL) {
+    //  actualCount++;
+      converter.str(line);
+      u4 size;
+      converter >> size;
+      //ALOGE("size is %d, size != 0 is %d, clazz is: %s", size, size!=0, clazz->descriptor);
+      u4 sz = ((size - 1) >> 5) + 1;
+      u4 maxFields = clazz->sfieldCount;
+      u4 fsz = (maxFields - 1) >> 5;
+      u4 migrate;
+      u4* highbits = maxFields > 32 ? (u4*)calloc(fsz, 4) : (u4*)NULL;
+      for(u4 i = 0; i < sz; i++) {
+        u4 accInfo;
+        converter >> accInfo;
+        if(i == 0) {
+          migrate = accInfo;
+        } else {
+          highbits[i - 1] = accInfo;
+        }
+        for(int j = 0; j < 31; j++) {
+          if(((accInfo >> j) & 0x1) != 0) {
+            StaticField* fld = clazz->sfields + (i * 32 + j);
+            if(*fld->signature == '[' || *fld->signature == 'L') {
+              JValue* val = &fld->value;
+              Object* fldObj = (Object*) val->l;
+              if(fldObj != NULL) {
+                //offAddObjectIntoTrack(fldObj, NULL);
+                objVec->push_back(fldObj);
+              }
+            }
+          }
+        }
+      }
+      converter.str("");
+      converter.clear();
+      if(!clazz->offInfo.isQueued) {
+        pthread_mutex_lock(&gDvm.offCommLock);
+        clazz->offInfo.isQueued = true;
+        offAddToWriteQueueLocked(clazz);
+        pthread_mutex_unlock(&gDvm.offCommLock);
+      }
+      bool isDirty = isObjectDirty(&clazz->offInfo);
+      if(isDirty) {
+        // write object info
+        /* Write the object definition. */
+        JValue valobj; valobj.l = clazz;
+        writeValue(fb, 'L', &valobj);  
+          
+        /* Write the dirty bits. */
+        writeU4(fb, clazz->offInfo.dirty & migrate);
+        //ALOGE("offloading send: object id: %d, dirty: %u", clazz->objId, clazz->offInfo.dirty & migrate);
+        if(maxFields > 32) {
+          for(u4 j = 0; j < fsz; j++) {
+            writeU4(fb, clazz->offInfo.bits[j] & highbits[j]);
+            //ALOGE("offloading send: object id: %d, dirty bits j: %d, value: %u", clazz->objId, j, clazz->offInfo.bits[j] & highbits[j]);
+          }
+        }
+      }
 
       StaticField* fld = clazz->sfields;
       StaticField* efld = fld + clazz->sfieldCount;
       for(; fld != efld; ++fld) {
-        if(isFieldDirty(info, fld - clazz->sfields)) {
-          if(*fld->signature != '[' && *fld->signature != 'L') {
-            continue;
-          }
-          JValue* val = &fld->value;
-          Object* fldObj = (Object*) val->l;
-          if(fldObj != NULL) {
-            offAddObjectIntoTrack(fldObj, NULL, true);
-            const char* descriptor = isClassObject(fldObj) ? ((ClassObject*)fldObj)->descriptor : fldObj->clazz->descriptor;
-            if(!strcmp(descriptor, "Ljava/lang/ref/WeakReference;")) {
-                ALOGE("find a weak reference, the obj is: %s", isClassObject(obj) ? ((ClassObject*)obj)->descriptor : obj->clazz->descriptor);
-            }
+        u4 offset = fld - clazz->sfields;
+        if(isFieldDirty(&clazz->offInfo, offset)) {
+          if((offset < 32 && (((migrate >> offset) & 0x1) != 0))
+            || (offset >= 32 && ((highbits[(offset - 32) >> 5] & (1U << (offset & 0x1F))) != 0))) {
+            writeValue(fb, *fld->signature, (JValue*)&fld->value);
           }
         }
       }
-    } else {
-      ClassObject* clazz = obj->clazz;
-      if(*clazz->descriptor == '[') {
-        /* For array objects we send the whole array contents for now. */
-        ArrayObject* aobj = (ArrayObject*)obj;
-        char type = aobj->clazz->descriptor[1];
-        if(type != '[' && type != 'L') {
-          continue;
-        }
-        char* contents = (char*)aobj->contents;
-
-        u4 typeWidth = auxTypeWidth(aobj->clazz->descriptor[1]);
-        for(u4 j = 0; j < aobj->length; j++, contents += typeWidth) {
-          if(isFieldDirty(info, j)) {
-            JValue* val = (JValue*) contents;
-            Object* fldObj = (Object*) val->l;
-            if(fldObj != NULL) {
-              offAddObjectIntoTrack(fldObj, NULL, true);
-            const char* descriptor = isClassObject(fldObj) ? ((ClassObject*)fldObj)->descriptor : fldObj->clazz->descriptor;
-            if(!strcmp(descriptor, "Ljava/lang/ref/WeakReference;")) {
-                ALOGE("find a weak reference, the obj is: %s", isClassObject(obj) ? ((ClassObject*)obj)->descriptor : obj->clazz->descriptor);
-            }
-            }
+      if(isDirty) {
+        clazz->offInfo.dirty = clazz->offInfo.dirty & ~migrate;
+        if(maxFields > 32) {
+          for(u4 j = 0; j < fsz; j++) {
+            clazz->offInfo.bits[j] = clazz->offInfo.bits[j] & ~highbits[j];
           }
         }
-      } else {
-        /* For normal class objects we write out all the instance fields. */
-        for(; clazz; clazz = clazz->super) {
-          InstField* fld = clazz->ifields;
-          InstField* efld = fld + clazz->ifieldCount;
-          for(; fld != efld; ++fld) {
-            if(isFieldDirty(info, (fld->byteOffset - sizeof(Object)) >> 2)) {
-              if(*fld->signature != '[' && *fld->signature != 'L') {
-                continue;
-              }
-              JValue* val = (JValue*) ((char*)obj + fld->byteOffset);
-              Object* fldObj = (Object*) val->l;
-              if(fldObj != NULL) {
-                offAddObjectIntoTrack(fldObj, NULL, true);
-            const char* descriptor = isClassObject(fldObj) ? ((ClassObject*)fldObj)->descriptor : fldObj->clazz->descriptor;
-            if(!strcmp(descriptor, "Ljava/lang/ref/WeakReference;")) {
-                ALOGE("find a weak reference, the obj is: %s", isClassObject(obj) ? ((ClassObject*)obj)->descriptor : obj->clazz->descriptor);
-            }
-              }
-            }
-          }
-        }
+      }
+      if(highbits != NULL) {
+        free(highbits);
       }
     }
+    //u8 pend = dvmGetRelativeTimeUsec();
+    //timeusedforparse+= pend-pstart;
   }
-  auxVectorResize(&gDvm.offClassReachableQueue, 0);
+ // u8 astart = dvmGetRelativeTimeUsec();
+  offAddVectorIntoTrack(objVec, fb);
+  //u8 aend = dvmGetRelativeTimeUsec();
+ // timeusedforadd += aend - astart;
+  delete(objVec);
+  //u8 endtime = dvmGetRelativeTimeUsec();
+  //ALOGE("sync scan class time with clazz info is: %llu, classCount: %d, actualCount: %d, timeusedforfile: %d, timeusedforparse: %d, timeusedforadd: %d", endtime-starttime, classCount, actualCount, timeusedforfile, timeusedforparse, timeusedforadd);
 }
 
 static bool isObjectDirty(ObjectInfo* info) {
@@ -429,23 +696,6 @@ static bool isFieldDirty(ObjectInfo* info, u4 fieldIndex) {
   return isFieldDirtyRaw(info->dirty, info->bits, fieldIndex);
 }
 
-static bool isFieldMigrateRaw(u4 migrate, u4* highbits, u4 fieldIndex) {
-  if(fieldIndex < 32) {
-    return (migrate & 1U << fieldIndex) != 0;
-  }
-  if(highbits == NULL) {
-    return false;
-  }
-  return (highbits[(fieldIndex - 32) >> 5] & (1U << (fieldIndex & 0x1F))) != 0;
-}
-
-static bool isFieldMigrate(ObjectInfo* info, u4 fieldIndex) {
-  if(info->allFlag) {
-    return true;
-  }
-  return isFieldMigrateRaw(info->migrate, info->highbits, fieldIndex);
-}
-
 /* Only allowed in sync operations.  Clear a dirty bit.  Intended to be used in
  * syncPull when the other endpoint overwrites something. */
 static void clearDirty(ObjectInfo* info, u4 fieldIndex) {
@@ -455,22 +705,6 @@ static void clearDirty(ObjectInfo* info, u4 fieldIndex) {
     info->bits[(fieldIndex - 32) >> 5] &= ~(1U << (fieldIndex & 0x1F));
   }
 }
-
-#define READWRITEFUNC(type, size, ntoh, hton)                                 \
-  static void write##size(FifoBuffer* fb, type v) {                           \
-    v = hton(v);                                                              \
-    auxFifoPushData(fb, (char*)&v, sizeof(v));                                \
-  }                                                                           \
-  static type read##size(FifoBuffer* fb) {                                    \
-    type v;                                                                   \
-    auxFifoReadBuffer(fb, (char*)&v, sizeof(v));                              \
-    return ntoh(v);                                                           \
-  }
-
-READWRITEFUNC(u1, U1, , );
-READWRITEFUNC(u2, U2, ntohs, htons);
-READWRITEFUNC(u4, U4, ntohl, htonl);
-READWRITEFUNC(u8, U8, ntohll, htonll);
 
 static void writeValue(FifoBuffer* fb, char type, JValue* val) {
   switch(type) {
@@ -530,7 +764,6 @@ static void readValue(Thread* self, FifoBuffer* fb, char type,
         /*if(*clazz->descriptor == '[') {
         ALOGE("read array instance length: %d, class descriptor: %s, clId is: %d", arrLength, clazz->descriptor, clId);
         }*/
-
         Object* obj = offIdToObject(objId);
         /*if(isClassObject(obj)) {
             ALOGE("read object clazz id: %d", clId);
@@ -614,11 +847,7 @@ void expandProxies(FifoBuffer* fb) {
   }
 }
 
-void offSyncPush() {
-  offSyncPushDoIf(NULL, NULL, NULL, NULL);
-}
-
-void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
+void offSyncPushDoIfLocal(bool(*before_func)(void*), void* before_arg,
                      void(*after_func)(void*, FifoBuffer*), void* after_arg) {
   Thread* self = dvmThreadSelf();
 
@@ -645,22 +874,125 @@ void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
 
   u4 i, j;
   FifoBuffer fb = auxFifoCreate();
-  if(!gDvm.isServer) {
-    /* add static class reachable object into write queue */
-    u4 size = auxVectorSize(&gDvm.offClassReachableQueue);
-    u8 starttime = dvmGetRelativeTimeUsec();
-    addClazzReachableObj();
-    u8 endtime = dvmGetRelativeTimeUsec();
-    ALOGE("sync scan class time: %llu, scaned class: %d", endtime - starttime, size);
-  }
-
-  u8 starttime = dvmGetRelativeTimeUsec();
-  /* Send over stack information. */
-  FifoBuffer sfb = auxFifoCreate();
-  offPushAllStacks(&sfb);
 
   /* Send over new class status updates. */
-  ALOGI("gDvm.offStatusUpdate size is: %u", auxVectorSize(&gDvm.offStatusUpdate));
+  //ALOGI("gDvm.offStatusUpdate size is: %u", auxVectorSize(&gDvm.offStatusUpdate));
+  for(j = 0; j < auxVectorSize(&gDvm.offStatusUpdate); j++) {
+    ClassObject* clazz = (ClassObject*)auxVectorGet(&gDvm.offStatusUpdate, j).l;
+    //ALOGE("offloading send: clazz id: %d, clazz name: %s", clazz->objId, clazz->descriptor);
+    if(clazz->super == gDvm.classJavaLangReflectProxy) {
+        continue;
+    }
+
+    JValue valobj; valobj.l = clazz;
+    writeValue(&fb, 'L', &valobj);
+    writeU4(&fb, (u4)clazz->status);
+    writeU4(&fb, (u4)clazz->initThreadId);
+  }
+  auxVectorResize(&gDvm.offStatusUpdate, 0);
+  JValue valobj; valobj.l = NULL;
+  writeValue(&fb, 'L', &valobj);
+
+  //u8 starttime = dvmGetRelativeTimeUsec();
+  /* Send over stack information. */
+  FifoBuffer sfb = auxFifoCreate();
+  offPushAllStacks(&sfb, &fb);
+  /* Terminate the object list. */
+  valobj.l = NULL;
+  writeValue(&fb, 'L', &valobj);
+
+  /* Clear the dirty bits. */
+  for(i = 0; i < auxVectorSize(&gDvm.offWriteQueue); i++) {
+    Object* obj = auxVectorGet(&gDvm.offWriteQueue, i).l;
+    ObjectInfo* info = offIdObjectInfo(obj->objId);
+    info->isQueued = false;
+  }
+  auxVectorResize(&gDvm.offWriteQueue, 0);
+   // u8 endtime1 = dvmGetRelativeTimeUsec();
+    //ALOGE("sync scan construct sending data time: %llu", endtime1 - starttime);
+
+  if(after_func) after_func(after_arg, &sfb);
+  dvmResumeAllThreads(SUSPEND_FOR_GC);
+
+  /* Actually send over the data.  We need to send the size of the data so that
+   * the other endpoint can buffer in the whole thing before suspending the vm.
+   */
+  u4 total_bytes = auxFifoSize(&fb) + auxFifoSize(&sfb);
+  offWriteU4(self, total_bytes);
+  while(!auxFifoEmpty(&fb)) {
+    u4 bytes = auxFifoGetBufferSize(&fb);
+    offSendMessage(self, auxFifoGetBuffer(&fb), bytes);
+    auxFifoPopBytes(&fb, bytes);
+  }
+  auxFifoDestroy(&fb);
+  while(!auxFifoEmpty(&sfb)) {
+    u4 bytes = auxFifoGetBufferSize(&sfb);
+    offSendMessage(self, auxFifoGetBuffer(&sfb), bytes);
+    auxFifoPopBytes(&sfb, bytes);
+  }
+  auxFifoDestroy(&sfb);
+    //u8 endtime = dvmGetRelativeTimeUsec();
+   // ALOGE("sync scan send data time: %llu", endtime - endtime1);
+
+  /* Send over any loaded dex files.  Usually there is nothing to do here.
+   * However if there is work to do it will be done lockstep with the client.
+   * We wish to avoid suspending the whole VM for this part of the sync. */
+  offPushDexFiles(self);
+
+  /* Wait for the sync to complete. */
+  offThreadWaitForResume(self);
+  TIMER_END(self->threadId, "syncPush", total_bytes, 0);
+  if(gDvm.offSyncTime == 0) {
+    gDvm.offSyncTime =  _end_time_us_ / 50;
+  } else {
+    gDvm.offSyncTime = (15 * gDvm.offSyncTime + _end_time_us_) / 16;
+  }
+  ++gDvm.offSyncTimeSamples;
+}
+
+void offSyncPush() {
+  offSyncPushDoIf(NULL, NULL, NULL, NULL);
+}
+
+void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
+                     void(*after_func)(void*, FifoBuffer*), void* after_arg) {
+  if(!gDvm.isServer) {
+    offSyncPushDoIfLocal(before_func, before_arg, after_func, after_arg);
+    return;
+  }
+  Thread* self = dvmThreadSelf();
+
+  TIMER_BEGIN();
+  dvmSuspendAllThreads(SUSPEND_FOR_GC);
+
+  if(before_func && !before_func(before_arg)) {
+    dvmResumeAllThreads(SUSPEND_FOR_GC);
+    return;
+  }
+  
+  /* Send revision header. */
+  offWriteU4(self, gDvm.offSendRevision++);
+
+  /* Send over proxy definitions. */
+  offWriteU4(self, auxFifoSize(&gDvm.offProxyFifo));
+  while(!auxFifoEmpty(&gDvm.offProxyFifo)) {
+    u4 bytes = auxFifoGetBufferSize(&gDvm.offProxyFifo);
+    offSendMessage(self, auxFifoGetBuffer(&gDvm.offProxyFifo), bytes);
+    auxFifoPushData(&gDvm.offProxyFifoAll,
+                    auxFifoGetBuffer(&gDvm.offProxyFifo), bytes);
+    auxFifoPopBytes(&gDvm.offProxyFifo, bytes);
+  }
+
+  u4 i, j;
+  FifoBuffer fb = auxFifoCreate();
+
+  //u8 starttime = dvmGetRelativeTimeUsec();
+  /* Send over stack information. */
+  FifoBuffer sfb = auxFifoCreate();
+  offPushAllStacks(&sfb, &fb);
+
+  /* Send over new class status updates. */
+  //ALOGI("gDvm.offStatusUpdate size is: %u", auxVectorSize(&gDvm.offStatusUpdate));
   for(j = 0; j < auxVectorSize(&gDvm.offStatusUpdate); j++) {
     ClassObject* clazz = (ClassObject*)auxVectorGet(&gDvm.offStatusUpdate, j).l;
     //ALOGE("offloading send: clazz id: %d, clazz name: %s", clazz->objId, clazz->descriptor);
@@ -683,7 +1015,6 @@ void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
     Object* obj = auxVectorGet(&gDvm.offWriteQueue, i).l; assert(obj);
     ObjectInfo* info = offIdObjectInfo(obj->objId); assert(info);
     if(!gDvm.isServer && !isObjectDirty(info)) {
-      //ALOGE("offloading send: object id: %d, object is not dirty, clazz is: %s", obj->objId, obj->clazz->descriptor);
       continue;
     }
     //ALOGE("offloading send: object id: %d", obj->objId);
@@ -694,27 +1025,15 @@ void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
 
     /* Write the dirty bits. */
     u4 maxIndex = getMaxFieldIndex(obj);
-    if(gDvm.isServer || info->allFlag) {
       writeU4(&fb, info->dirty);
       //ALOGE("offloading send: object id: %d, dirty: %u, in allFlag", obj->objId, info->dirty);
-      if(maxIndex > 32) {
-        u4 bsz = (maxIndex - 1) >> 5;
-        for(j = 0; j < bsz; j++) info->bits[j] = htonl(info->bits[j]);
-        auxFifoPushData(&fb, (char*)info->bits, bsz << 2);
-        for(j = 0; j < bsz; j++) {
-          info->bits[j] = ntohl(info->bits[j]);
-          //ALOGE("offloading send: object id: %d, dirty bits j: %d, value: %u", obj->objId, j, info->bits[j]);
-        }
-      }
-    } else {
-      writeU4(&fb, info->dirty & info->migrate);
-      //ALOGE("offloading send: object id: %d, dirty: %u", obj->objId, info->dirty & info->migrate);
-      if(maxIndex > 32) {
-        u4 bsz = (maxIndex - 1) >> 5;
-        for(j = 0; j < bsz; j++) {
-          writeU4(&fb, info->bits[j] & info->highbits[j]);
-          //ALOGE("offloading send: object id: %d, dirty bits j: %d, value: %u", obj->objId, j, info->bits[j] & info->highbits[j]);
-        }
+    if(maxIndex > 32) {
+      u4 bsz = (maxIndex - 1) >> 5;
+      for(j = 0; j < bsz; j++) info->bits[j] = htonl(info->bits[j]);
+      auxFifoPushData(&fb, (char*)info->bits, bsz << 2);
+      for(j = 0; j < bsz; j++) {
+        info->bits[j] = ntohl(info->bits[j]);
+        //ALOGE("offloading send: object id: %d, dirty bits j: %d, value: %u", obj->objId, j, info->bits[j]);
       }
     }
 
@@ -726,10 +1045,7 @@ void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
       StaticField* fld = clazz->sfields;
       StaticField* efld = fld + clazz->sfieldCount;
       for(; fld != efld; ++fld) {
-        if(gDvm.isServer && isFieldDirty(info, fld - clazz->sfields)) {
-          writeValue(&fb, *fld->signature, (JValue*)&fld->value);
-          dirty_fields++;
-        } else if(!gDvm.isServer && isFieldDirty(info, fld - clazz->sfields) && isFieldMigrate(info, fld - clazz->sfields)) {
+        if(isFieldDirty(info, fld - clazz->sfields)) {
           writeValue(&fb, *fld->signature, (JValue*)&fld->value);
           dirty_fields++;
         }
@@ -744,10 +1060,7 @@ void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
 
         u4 typeWidth = auxTypeWidth(aobj->clazz->descriptor[1]);
         for(j = 0; j < aobj->length; j++, contents += typeWidth) {
-          if(gDvm.isServer && isFieldDirty(info, j)) {
-            writeValue(&fb, aobj->clazz->descriptor[1], (JValue*)contents);
-            dirty_fields++;
-          } else if(!gDvm.isServer && isFieldDirty(info, j) && isFieldMigrate(info, j)) {
+          if(isFieldDirty(info, j)) {
             writeValue(&fb, aobj->clazz->descriptor[1], (JValue*)contents);
             dirty_fields++;
           }
@@ -759,13 +1072,8 @@ void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
           InstField* fld = clazz->ifields;
           InstField* efld = fld + clazz->ifieldCount;
           for(; fld != efld; ++fld) {
-            if(gDvm.isServer && isFieldDirty(info,
+            if(isFieldDirty(info,
                (fld->byteOffset - sizeof(Object)) >> 2)) {
-              writeValue(&fb, *fld->signature,
-                         (JValue*)(((char*)obj) + fld->byteOffset));
-              dirty_fields++;
-            } else if(!gDvm.isServer && isFieldDirty(info, (fld->byteOffset - sizeof(Object)) >> 2) 
-                       && isFieldMigrate(info, (fld->byteOffset - sizeof(Object)) >> 2)) {
               writeValue(&fb, *fld->signature,
                          (JValue*)(((char*)obj) + fld->byteOffset));
               dirty_fields++;
@@ -786,32 +1094,14 @@ void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
     info->isQueued = false;
 
     u4 maxIndex = getMaxFieldIndex(obj);
-    if(gDvm.isServer || info->allFlag) {
-      info->dirty = 0;
-      if(maxIndex > 32) {
-        memset(info->bits, 0, ((maxIndex - 1) >> 5) << 2);
-      }
-    } else {
-      info->dirty = info->dirty & ~info->migrate;
-      if(maxIndex > 32) {
-        u4 bsz = (maxIndex - 1) >> 5;
-        for(j = 0; j < bsz; j++) {
-          info->bits[j] = info->bits[j] & ~info->highbits[j];
-        }
-      }
-    }
-    if(!gDvm.isServer) {
-      info->allFlag = false;
-      info->migrate = 0x00000000U;
-      if(info->highbits != NULL) {
-        free(info->highbits);
-        info->highbits = NULL;
-      }
+    info->dirty = 0;
+    if(maxIndex > 32) {
+      memset(info->bits, 0, ((maxIndex - 1) >> 5) << 2);
     }
   }
   auxVectorResize(&gDvm.offWriteQueue, 0);
-    u8 endtime1 = dvmGetRelativeTimeUsec();
-    ALOGE("sync construct sending data time: %llu", endtime1 - starttime);
+    //u8 endtime1 = dvmGetRelativeTimeUsec();
+    //ALOGE("sync construct sending data time: %llu", endtime1 - starttime);
 
   if(after_func) after_func(after_arg, &sfb);
   dvmResumeAllThreads(SUSPEND_FOR_GC);
@@ -833,8 +1123,8 @@ void offSyncPushDoIf(bool(*before_func)(void*), void* before_arg,
     auxFifoPopBytes(&sfb, bytes);
   }
   auxFifoDestroy(&sfb);
-    u8 endtime = dvmGetRelativeTimeUsec();
-    ALOGE("sync send data time: %llu", endtime - starttime);
+    //u8 endtime = dvmGetRelativeTimeUsec();
+    //ALOGE("sync send data time: %llu, total bytes: %d", endtime - starttime, total_bytes);
 
   /* Send over any loaded dex files.  Usually there is nothing to do here.
    * However if there is work to do it will be done lockstep with the client.
@@ -924,14 +1214,18 @@ bool offSyncPullDo(void(*before_func)(void*), void* before_arg,
     dvmWaitForConcurrentGcToComplete();
   }
   dvmSuspendAllThreads(SUSPEND_FOR_GC);
+  /* disable concurrent gc from here since it might raise a deadlock
+   * this happens because when concurrent gc starts, it will grab dvmLockHeap,
+   * after it grabs the lock, it will check if it needs to suspend, if so, the gc thread suspends
+   * which makes the current allocate threads cannot work
+   */
+  gDvm.conGcDisabled = true;
   dvmUnlockHeap();
-
   TIMER_RESET();
   if(before_func) before_func(before_arg);
 
   expandProxies(&fbproxy);
   auxFifoDestroy(&fbproxy);
-
   /* Read in new class statuses. */
   for(;;) {
     JValue valobj; readValue(self, &fb, 'L', &valobj, false);
@@ -962,7 +1256,7 @@ bool offSyncPullDo(void(*before_func)(void*), void* before_arg,
     /* Read in the dirty bits. */
     u4 maxIndex = getMaxFieldIndex(obj);
     u4 dirty = readU4(&fb);
-    //ALOGE("offloading receive: object id: %d, dirty: %u", obj->objId, info->dirty);
+    //ALOGE("offloading receive: object id: %d, dirty: %u", obj->objId, dirty);
     if(maxIndex > 32) {
       u4 bsz = (maxIndex - 1) >> 5;
       if(bsz > bitsSz) {
@@ -975,7 +1269,7 @@ bool offSyncPullDo(void(*before_func)(void*), void* before_arg,
         //ALOGE("offloading receive: object id: %d, dirty bits j: %d, value: %u", obj->objId, j, bits[j]);
       }
     }
-
+    
     if(isClassObject(obj)) {
       ClassObject* clazz = (ClassObject*)obj;
       //ALOGE("offloading receive: class id: %d, descriptor: %s", obj->objId, clazz->descriptor);
@@ -1026,7 +1320,7 @@ bool offSyncPullDo(void(*before_func)(void*), void* before_arg,
   }
   free(bits);
 
-  offPullAllStacks(&fb);        
+  offPullAllStacks(&fb);
   if(after_func) after_func(after_arg, &fb);        
 
   assert(auxFifoSize(&fb) == 0);
@@ -1039,6 +1333,8 @@ bool offSyncPullDo(void(*before_func)(void*), void* before_arg,
   gDvm.offRecvRevision++;
   pthread_cond_broadcast(&gDvm.offPullCond);
   pthread_mutex_unlock(&gDvm.offCommLock);
+  // enable concurrent gc again
+  gDvm.conGcDisabled = false;
   dvmResumeAllThreads(SUSPEND_FOR_GC);
 
   return true;
@@ -1172,13 +1468,13 @@ ALOGI("ITERATION E %d", iterations);
 }
 
 bool offCommStartup() {
+  gDvm.conGcDisabled = false;
   gDvm.nextId = 0;
   gDvm.idMask = gDvm.isServer ? 1U << 30 : 0;
   memset(gDvm.objTables, 0, sizeof(gDvm.objTables));
   pthread_mutex_init(&gDvm.offCommLock, NULL);
   pthread_cond_init(&gDvm.offPullCond, NULL);
   gDvm.offWriteQueue = auxVectorCreate(0);
-  gDvm.offClassReachableQueue = auxVectorCreate(0);
   gDvm.offRecvRevision = gDvm.offSendRevision = 0;
   pthread_mutex_init(&gDvm.offProxyLock, NULL);
   gDvm.offProxyFifo = auxFifoCreate();
@@ -1194,7 +1490,6 @@ void offCommShutdown() {
     offTableDestroy(&gDvm.objTables[i]);
   }
   auxVectorDestroy(&gDvm.offWriteQueue);
-  auxVectorDestroy(&gDvm.offClassReachableQueue);
 }
 
 /* Special native files to add tracking code.

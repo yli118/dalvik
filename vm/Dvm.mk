@@ -315,7 +315,8 @@ endif
 
 ifeq ($(dvm_offload),true)
   LOCAL_CFLAGS += -DWITH_OFFLOAD \
-                  -DWITH_MONITOR_TRACKING
+                  -DWITH_MONITOR_TRACKING \
+                  -std=gnu++0x
   ifeq ($(dvm_make_debug_vm),true)
     LOCAL_CFLAGS += -fno-inline -DOFFLOAD_DEBUG
   else

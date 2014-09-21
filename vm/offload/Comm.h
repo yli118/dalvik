@@ -3,6 +3,7 @@
 
 #include "Inlines.h"
 #include "alloc/Heap.h"
+#include <vector>
 
 #define COMM_CLASS_BID 0x3U
 #define GET_ID_MASK(id) ((id) & 3U << 30U)
@@ -12,6 +13,7 @@
 
 struct Thread;
 struct Object;
+struct Method;
 struct ArrayObject;
 struct ClassObject;
 struct InstField;
@@ -39,18 +41,6 @@ typedef struct ObjectInfo {
 
   /* Tracks if the current endpoint owns this object's volatiles. */
   volatile bool isVolatileOwner;
-  
-  // flag indicates that all the attribute of the object should be marked as accessed to assure correctness
-  bool allFlag;
-
-  // recursively indicates the fields of the object
-  //ObjectAccResult* objAccInfo;
-   
-  /* Tracks the neccessity of migrating low field indexes. */
-  u4 migrate;
-
-  /* Tracks the dirtiness of high field indexes. */
-  u4* highbits;
 } ObjectInfo;
 
 /* Get the object associated with the passed identifier. */
@@ -63,7 +53,12 @@ struct ObjectInfo* offIdObjectInfo(u4 objId);
 void offAddTrackedObject(struct Object* obj);
 
 /* Add an object into track and handle its fields recursively */
-void offAddObjectIntoTrack(struct Object* objToAdd, struct ObjectAccResult* objAccInfoToAdd);
+void offAddObjectIntoTrack(struct Object* objToAdd, struct ObjectAccResult* objAccInfoToAdd, FifoBuffer* fb);
+
+void offAddVectorIntoTrack(std::vector<Object*>* objVec, FifoBuffer* fb);
+
+void pushAllClazzInfo(FifoBuffer* fb);
+void pushClazzInfo(const Method* method, char* key, FifoBuffer* fb);
 
 /* Register the proxy class. */
 void offRegisterProxy(struct ClassObject* clazz, char* str,

@@ -45,7 +45,8 @@ ifeq ($(WITH_HOST_DALVIK),true)
     LOCAL_STATIC_LIBRARIES :=  libcutils libexpat liblog libz
     LOCAL_LDLIBS += -ldl -lpthread
     LOCAL_CFLAGS += -DWITH_OFFLOAD \
-                    -DANDROID_SMP=1
+                    -DANDROID_SMP=1 \
+                    -m64
     LOCAL_MODULE_TAGS := optional
     LOCAL_MODULE := apkanalysis
     include $(BUILD_HOST_EXECUTABLE)

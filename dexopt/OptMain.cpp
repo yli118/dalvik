@@ -558,6 +558,8 @@ int main(int argc, char* const argv[])
 {
 #if defined(WITH_OFFLOAD)
     gDvm.offDisabled = true;
+    gDvm.methodExeTimeMap = new std::map<const Method*, u8>();
+    ALOGI("the offdisable is %d", gDvm.offDisabled);
 #endif
     set_process_name("dexopt");
 

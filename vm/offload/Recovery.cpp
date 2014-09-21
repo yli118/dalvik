@@ -185,10 +185,6 @@ static void cleanupOffloadState(Thread* self) {
       if(info && info->obj) {
         info->obj->objId = COMM_INVALID_ID;
         free(info->bits);
-        if(info->highbits != NULL) {
-          free(info->highbits);
-          info->highbits = NULL;
-        }
       }
     }
     offTableDestroy(&gDvm.objTables[i]);

@@ -3,23 +3,37 @@
 #include "CustomizedClass.h"
 #include "libdex/DexCatch.h"
 
-int MaxBranchDepth = 8;
-unsigned int MaxSubCount = 15;
+struct ParsedMethoOffInfo {
+    int offStart;
+    int length;
+};
+
+int MaxBranchDepth = INT_MAX;
+unsigned int MaxSubCount = INT_MAX;
+extern char* basePath;
 
 extern std::vector<DvmDex*> loadedDex;
 extern ClassObject* javaLangObject;
 extern std::vector<ClassObject*>* exemptClzs;
 extern std::vector<ClassObject*>* exemptIfs;
-std::vector<ObjectAccInfo*>* returnInterests;
-std::map<Method*, MethodAccInfo*> methodResMap;
-std::map<Method*, MethodAccInfo*> virtualResMap;
-std::map<Method*, MethodAccInfo*> interResMap;
-std::map<Method*, std::map<ClassObject*, BitsVec*>* > methodStaticMap;
+std::fstream strDictFile;
+std::fstream poffFile;
+std::fstream presultFile;
+std::fstream presultFileTxt;
+std::map<const char*, int, charscomp>* strOffMap = new std::map<const char*, int, charscomp>();
+std::map<int, const char*>* offStrMap = new std::map<int, const char*>();
+std::map<Method*, ParsedMethoOffInfo*>* parsedMethodOffMap = new std::map<Method*, ParsedMethoOffInfo*>();
+//std::map<Method*, MethodAccInfo*> virtualResMap;
+//std::map<Method*, MethodAccInfo*> interResMap;
 std::map<ClassObject*, std::vector<ClassObject*>* > subclassMap;
 std::map<ClassObject*, std::vector<ClassObject*>* > implclassMap;
 
 // method declaration
-void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>* chain, std::vector<int>* insOffsets, std::map<u2, std::vector<ObjectAccInfo*> >* interestRegObjMap, int depth, bool* exitMethod);
+static void copyParseInfo(ParseInfo* src, ParseInfo* dst);
+static void freeParseInfo(ParseInfo* parseInfo);
+static bool checkInterest(ParseInfo* parseInfo);
+static void loadStructureInFile(MethodAccInfo* methodAccInfo, int offStart, int length);
+void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::vector<Method*>* chain, int depth, bool* exitMethod);
 
 u2 inst_a(const u2* insns) {
     return (*insns >> 8) & 0x0f;
@@ -257,38 +271,6 @@ StaticField* resolveStaticField(const ClassObject* referrer, u4 sfieldIdx)
     return resField;
 }
 
-void freeObjectAccInfo(ObjectAccInfo* objAccInfo) {
-    if(objAccInfo == NULL) {
-        return;
-    }
-    for(unsigned int i = 0; i < objAccInfo->fieldSet.size(); i++) {
-        freeObjectAccInfo(objAccInfo->fieldSet[i]);
-        if(objAccInfo->trackSet[i] != NULL) {
-            delete objAccInfo->trackSet[i];
-        }
-    }
-    delete objAccInfo;
-}
-
-void freeMethodAccInfo(MethodAccInfo* methodAccInfo) {
-    for(unsigned int i = 0; i < methodAccInfo->args->size(); i++) {
-        freeObjectAccInfo(methodAccInfo->args->at(i));
-    }
-    delete methodAccInfo->args;
-    if(methodAccInfo->globalClazz != NULL) {
-        for(unsigned int i = 0; i < methodAccInfo->globalClazz->size(); i++) {
-            freeObjectAccInfo(methodAccInfo->globalClazz->at(i));
-        }
-        delete methodAccInfo->globalClazz;
-    }
-    if(methodAccInfo->returnObjs != NULL) {
-        delete methodAccInfo->returnObjs;
-    }
-    if(methodAccInfo->curMethodReturns != NULL) {
-        delete methodAccInfo->curMethodReturns;
-    }
-}
-
 void populateMethodAccInfo(MethodAccInfo* methodAccInfo) {
     Method* method = methodAccInfo->method;
     methodAccInfo->args = new std::vector<ObjectAccInfo*>();
@@ -298,149 +280,120 @@ void populateMethodAccInfo(MethodAccInfo* methodAccInfo) {
     methodAccInfo->globalClazz = new std::vector<ClazzAccInfo*>();
 }
 
-/* check if this object or its parent has been flagged as migrating all */
-bool isObjFlagedAll(ObjectAccInfo* objAccInfo) {
-    ObjectAccInfo* tmp = objAccInfo;
-    do {
-        if(tmp->allFlag) {
-            return true;
-        }
-        tmp = tmp->belonging;
-    } while(tmp != NULL);
-    return false;
-}
-
-bool isFlagedAllImpl(ObjectAccInfo* objAccInfo, std::set<ObjectAccInfo*>* chain) {
-    if(chain->find(objAccInfo) != chain->end()) {
-        return true;
-    }
-    if(!isObjFlagedAll(objAccInfo)) {
-        return false;
-    }
-    chain->insert(objAccInfo);
-    for(unsigned int i = 0; i < objAccInfo->trackSet.size(); i++) {
-        if(objAccInfo->trackSet[i] == NULL) {
-            continue;
-        }
-        for(unsigned int j = 0; j < objAccInfo->trackSet[i]->size(); j++) {
-            if(!isFlagedAllImpl(objAccInfo->trackSet[i]->at(j), chain)) {
-                return false;
-            }
-        }
-    }
-    chain->erase(objAccInfo);
-    return true;
-}
-
 /* check if the objects in the vector are all flaged as migrating all */
-bool isVecFlagedAll(std::vector<ObjectAccInfo*>* objsVector) {
+static bool isVecFlagedAll(std::set<ObjectAccInfo*>* objsVector) {
     if(objsVector == NULL) {
         return true;
     }
-    for(unsigned int i = 0; i < objsVector->size(); i++) {
-        std::set<ObjectAccInfo*> chain;
-        if(!isFlagedAllImpl(objsVector->at(i), &chain)) {
+    std::vector<ObjectAccInfo*> toProcess;
+    std::set<ObjectAccInfo*> processVec;
+    for(std::set<ObjectAccInfo*>::iterator it = objsVector->begin(); it != objsVector->end(); ++it) {
+        toProcess.push_back(*it);
+        processVec.insert(*it);
+    }
+    for(unsigned int i = 0; i < toProcess.size(); i++) {
+        ObjectAccInfo* objAccInfo = toProcess[i];
+        ObjectAccInfo* tmp = objAccInfo;
+        bool isflaged = false;
+        do {
+            if(tmp->allFlag) {
+                isflaged = true;
+                break;
+            }
+            tmp = tmp->belonging;
+        } while(tmp != NULL);
+        if(!isflaged) {
             return false;
+        }
+        for(unsigned int j = 0; j < objAccInfo->trackSet.size(); j++) {
+            if(objAccInfo->trackSet[j] == NULL) {
+                continue;
+            }
+            for(std::set<ObjectAccInfo*>::iterator it = objAccInfo->trackSet[j]->begin(); it != objAccInfo->trackSet[j]->end(); ++it) {
+                if(processVec.find(*it) == processVec.end()) {
+                    toProcess.push_back(*it);
+                    processVec.insert(*it);
+                }
+            }
         }
     }
     return true;
 }
 
-/* check if all the args are flagged as migrating all 
-bool isArgsFlaggedAll(MethodAccInfo* methodAccInfo) {
-    for(unsigned int i = 0; i < methodAccInfo->args->size(); i++) {
-        if(!isFlagedAll(methodAccInfo->args->at(i))) {
-            return false;
+static void flagObjAll(ObjectAccInfo* objAccInfoArg) {
+    std::vector<ObjectAccInfo*> toProcess;
+    std::set<ObjectAccInfo*> processVec;
+    toProcess.push_back(objAccInfoArg);
+    processVec.insert(objAccInfoArg);
+    for(unsigned int i = 0; i < toProcess.size(); i++) {
+        ObjectAccInfo* objAccInfo = toProcess[i];
+        objAccInfo->allFlag = true;
+        for(unsigned int j = 0; j < objAccInfo->fieldSet.size(); j++) {
+            if(objAccInfo->trackSet[j] == NULL) {
+                continue;
+            }
+            for(std::set<ObjectAccInfo*>::iterator it = objAccInfo->trackSet[j]->begin(); it != objAccInfo->trackSet[j]->end(); ++it) {
+                if(processVec.find(*it) == processVec.end()) {
+                    toProcess.push_back(*it);
+                    processVec.insert(*it);
+                }
+            }
         }
     }
-    return true;
-}*/
-
-void flagObjALLImpl(ObjectAccInfo* objAccInfo, std::set<ObjectAccInfo*>* chain) {
-    if(objAccInfo == NULL) {
-        return;
-    }
-    if(chain->find(objAccInfo) != chain->end()) {
-        return;
-    }
-    chain->insert(objAccInfo);
-    objAccInfo->allFlag = true;
-    for(unsigned int i = 0; i < objAccInfo->fieldSet.size(); i++) {
-        if(objAccInfo->trackSet[i] == NULL) {
-            continue;
-        }
-        for(unsigned int j = 0; j < objAccInfo->trackSet[i]->size(); j++) {
-            flagObjALLImpl(objAccInfo->trackSet[i]->at(j), chain);
-        }
-    }
-    chain->erase(objAccInfo);
-}
-
-void flagObjAll(ObjectAccInfo* objAccInfo) {
-    std::set<ObjectAccInfo*> chain;
-    flagObjALLImpl(objAccInfo, &chain);
 }
 
 /* flag all the objects in vector as migrating all */
-void flagVecAll(std::vector<ObjectAccInfo*>* objsVector) {
-    for(unsigned int i = 0; i < objsVector->size(); i++) {
-        flagObjAll(objsVector->at(i));
+static void flagVecAll(std::set<ObjectAccInfo*>* objsVector) {
+    std::vector<ObjectAccInfo*> toProcess;
+    std::set<ObjectAccInfo*> processVec;
+    for(std::set<ObjectAccInfo*>::iterator it = objsVector->begin(); it != objsVector->end(); ++it) {
+        toProcess.push_back(*it);
+        processVec.insert(*it);
     }
-}
-
-void flagObjALLArrayImpl(ObjectAccInfo* objAccInfo, std::set<ObjectAccInfo*>* chain) {
-    if(objAccInfo == NULL) {
-        return;
-    }
-    if(chain->find(objAccInfo) != chain->end()) {
-        return;
-    }
-    chain->insert(objAccInfo);
-    objAccInfo->allFlag = true;
-    objAccInfo->inArray = true;
-    for(unsigned int i = 0; i < objAccInfo->fieldSet.size(); i++) {
-        if(objAccInfo->trackSet[i] == NULL) {
-            continue;
-        }
-        for(unsigned int j = 0; j < objAccInfo->trackSet[i]->size(); j++) {
-            flagObjALLArrayImpl(objAccInfo->trackSet[i]->at(j), chain);
+    for(unsigned int i = 0; i < toProcess.size(); i++) {
+        ObjectAccInfo* objAccInfo = toProcess[i];
+        objAccInfo->allFlag = true;
+        for(unsigned int j = 0; j < objAccInfo->fieldSet.size(); j++) {
+            if(objAccInfo->trackSet[j] == NULL) {
+                continue;
+            }
+            for(std::set<ObjectAccInfo*>::iterator it = objAccInfo->trackSet[j]->begin(); it != objAccInfo->trackSet[j]->end(); ++it) {
+                if(processVec.find(*it) == processVec.end()) {
+                    toProcess.push_back(*it);
+                    processVec.insert(*it);
+                }
+            }
         }
     }
-    chain->erase(objAccInfo);
-}
-
-void flagObjAllArray(ObjectAccInfo* objAccInfo) {
-    std::set<ObjectAccInfo*> chain;
-    flagObjALLArrayImpl(objAccInfo, &chain);
 }
 
 /* flag all the objects in vector as migrating all */
-void flagVecAllArray(std::vector<ObjectAccInfo*>* objsVector) {
-    for(unsigned int i = 0; i < objsVector->size(); i++) {
-        flagObjAllArray(objsVector->at(i));
+static void flagVecAllArray(std::set<ObjectAccInfo*>* objsVector) {
+    std::vector<ObjectAccInfo*> toProcess;
+    std::set<ObjectAccInfo*> processVec;
+    for(std::set<ObjectAccInfo*>::iterator it = objsVector->begin(); it != objsVector->end(); ++it) {
+        toProcess.push_back(*it);
+        processVec.insert(*it);
     }
-}
-
-void pushSingle(std::vector<ObjectAccInfo*>* dst, ObjectAccInfo* obj) {
-    bool inDst = false;
-    for(unsigned int j = 0; j < dst->size(); j++) {
-        if(obj == dst->at(j)) {
-            inDst = true;
-            break;
+    for(unsigned int i = 0; i < toProcess.size(); i++) {
+        ObjectAccInfo* objAccInfo = toProcess[i];
+        objAccInfo->allFlag = true;
+        objAccInfo->inArray = true;
+        for(unsigned int j = 0; j < objAccInfo->fieldSet.size(); j++) {
+            if(objAccInfo->trackSet[j] == NULL) {
+                continue;
+            }
+            for(std::set<ObjectAccInfo*>::iterator it = objAccInfo->trackSet[j]->begin(); it != objAccInfo->trackSet[j]->end(); ++it) {
+                if(processVec.find(*it) == processVec.end()) {
+                    toProcess.push_back(*it);
+                    processVec.insert(*it);
+                }
+            }
         }
     }
-    if(!inDst) {
-        dst->push_back(obj);
-    }
 }
 
-void pushVec(std::vector<ObjectAccInfo*>* dst, std::vector<ObjectAccInfo*>* src) {
-    for(unsigned int i = 0; i < src->size(); i++) {
-        pushSingle(dst, src->at(i));
-    }
-}
-
-void unionObjectFieldInfo(ObjectAccInfo* dstObjAccInfo, ObjectAccInfo* srcObjAccInfo, std::map<ObjectAccInfo*, ObjectAccInfo*>* addrMap) {
+static void unionObjectFieldInfo(ObjectAccInfo* dstObjAccInfo, ObjectAccInfo* srcObjAccInfo, std::map<ObjectAccInfo*, ObjectAccInfo*>* addrMap, bool isDstBranch) {
     (*addrMap)[srcObjAccInfo] = dstObjAccInfo;
     if(srcObjAccInfo->allFlag) {
         dstObjAccInfo->allFlag = true;
@@ -449,10 +402,20 @@ void unionObjectFieldInfo(ObjectAccInfo* dstObjAccInfo, ObjectAccInfo* srcObjAcc
         dstObjAccInfo->inArray = true;
     }
     if(dstObjAccInfo->fieldSet.size() < srcObjAccInfo->fieldSet.size()) {
+        dstObjAccInfo->nullBranchFlags.resize(srcObjAccInfo->fieldSet.size());
         dstObjAccInfo->fieldSet.resize(srcObjAccInfo->fieldSet.size());
         dstObjAccInfo->trackSet.resize(srcObjAccInfo->trackSet.size());
     }
     for(unsigned int i = 0; i < srcObjAccInfo->fieldSet.size(); i++) {
+        if(!(dstObjAccInfo->nullBranchFlags[i])) {
+            dstObjAccInfo->nullBranchFlags[i] = srcObjAccInfo->nullBranchFlags[i] || dstObjAccInfo->nullBranchFlags[i];
+            if(srcObjAccInfo->fieldSet[i] == NULL && srcObjAccInfo->trackSet[i] == NULL) {
+                dstObjAccInfo->nullBranchFlags[i] = true;
+            }
+            if(isDstBranch && dstObjAccInfo->fieldSet[i] == NULL && dstObjAccInfo->trackSet[i] == NULL) {
+                dstObjAccInfo->nullBranchFlags[i] = true;
+            }
+        }
         if(srcObjAccInfo->fieldSet[i] == NULL) {
             continue;
         }
@@ -460,11 +423,11 @@ void unionObjectFieldInfo(ObjectAccInfo* dstObjAccInfo, ObjectAccInfo* srcObjAcc
             dstObjAccInfo->fieldSet[i] = new ObjectAccInfo();
             dstObjAccInfo->fieldSet[i]->belonging = dstObjAccInfo;
         }
-        unionObjectFieldInfo(dstObjAccInfo->fieldSet[i], srcObjAccInfo->fieldSet[i], addrMap);
+        unionObjectFieldInfo(dstObjAccInfo->fieldSet[i], srcObjAccInfo->fieldSet[i], addrMap, isDstBranch);
     }
 }
 
-void createMatchTrack(ObjectAccInfo* srcTrackObj, std::map<ObjectAccInfo*, ObjectAccInfo*>* addrMap) {
+static void createMatchTrack(ObjectAccInfo* srcTrackObj, std::map<ObjectAccInfo*, ObjectAccInfo*>* addrMap) {
     // indicates that in the iput, only the vdst is in the interest, we make a new corresponding object
     ObjectAccInfo* newAccInfo = new ObjectAccInfo();
     (*addrMap)[srcTrackObj] = newAccInfo;
@@ -474,46 +437,110 @@ void createMatchTrack(ObjectAccInfo* srcTrackObj, std::map<ObjectAccInfo*, Objec
     if(srcTrackObj->inArray) {
         newAccInfo->inArray = true;
     }
+    newAccInfo->nullBranchFlags.resize(srcTrackObj->nullBranchFlags.size());
     newAccInfo->fieldSet.resize(srcTrackObj->fieldSet.size());
     newAccInfo->trackSet.resize(srcTrackObj->trackSet.size());
     for(unsigned int i = 0; i < newAccInfo->trackSet.size(); i++) {
         if(srcTrackObj->trackSet[i] == NULL) {
             continue;
         }
-        newAccInfo->trackSet[i] = new std::vector<ObjectAccInfo*>();
-        for(unsigned int j = 0; j < srcTrackObj->trackSet[i]->size(); j++) {
-            if((*addrMap)[srcTrackObj->trackSet[i]->at(j)] == NULL) {
-                createMatchTrack(srcTrackObj->trackSet[i]->at(j), addrMap);
+        newAccInfo->trackSet[i] = new std::set<ObjectAccInfo*>();
+        for(std::set<ObjectAccInfo*>::iterator it = srcTrackObj->trackSet[i]->begin(); it != srcTrackObj->trackSet[i]->end(); ++it) {
+            if((*addrMap).find(*it) == (*addrMap).end()) {
+                createMatchTrack(*it, addrMap);
             }
-            newAccInfo->trackSet[i]->push_back((*addrMap)[srcTrackObj->trackSet[i]->at(j)]);
+            newAccInfo->trackSet[i]->insert((*addrMap)[*it]);
         }
     }
 }
 
-void unionObjectTrackInfo(ObjectAccInfo* dstObjAccInfo, ObjectAccInfo* srcObjAccInfo, std::map<ObjectAccInfo*, ObjectAccInfo*>* addrMap) {
+static void handleUnmatchTrack(std::set<ObjectAccInfo*>* dstTrackSet, ObjectAccInfo* srcTrackObj, std::map<ObjectAccInfo*, ObjectAccInfo*>* addrMap, std::set<ObjectAccInfo*>* fieldAccSet) {
+    bool isHandled = false;
+    for(std::set<ObjectAccInfo*>::iterator it = dstTrackSet->begin(); it != dstTrackSet->end(); ++it) {
+        if(fieldAccSet->find(*it) == fieldAccSet->end()) {
+            isHandled = true;
+            (*addrMap)[srcTrackObj] = *it;
+            (*it)->allFlag = (*it)->allFlag || srcTrackObj->allFlag;
+            (*it)->inArray = (*it)->inArray || srcTrackObj->inArray;
+            if((*it)->trackSet.size() < srcTrackObj->trackSet.size()) {
+                (*it)->nullBranchFlags.resize(srcTrackObj->nullBranchFlags.size());
+                (*it)->fieldSet.resize(srcTrackObj->fieldSet.size());
+                (*it)->trackSet.resize(srcTrackObj->trackSet.size());
+            }
+            for(unsigned int i = 0; i < srcTrackObj->trackSet.size(); i++) {
+                if(srcTrackObj->trackSet[i] == NULL || srcTrackObj->trackSet[i]->empty()) {
+                    continue;
+                }
+                if((*it)->trackSet[i] == NULL) {
+                    (*it)->trackSet[i] = new std::set<ObjectAccInfo*>();
+                }
+                for(std::set<ObjectAccInfo*>::iterator tit = srcTrackObj->trackSet[i]->begin(); tit != srcTrackObj->trackSet[i]->end(); ++tit) {
+                    if((*addrMap).find(*tit) == (*addrMap).end()) {
+                        handleUnmatchTrack((*it)->trackSet[i], *tit, addrMap, fieldAccSet);
+                    }
+                    (*it)->trackSet[i]->insert((*addrMap)[*tit]);
+                }
+            }
+            break;
+        }
+    }
+    if(!isHandled) {
+        createMatchTrack(srcTrackObj, addrMap);
+    }
+}
+
+static void unionTracks(std::map<ObjectAccInfo*, ObjectAccInfo*>* addrMap, std::set<ObjectAccInfo*>* fieldAccSet) {
+    // addr should have all the mapping between dst and src already
+    std::set<ObjectAccInfo*> srcSet;
+    for(std::map<ObjectAccInfo*, ObjectAccInfo*>::iterator it = addrMap->begin(); it != addrMap->end(); ++it) {
+        srcSet.insert(it->first);
+    }
+    for(std::set<ObjectAccInfo*>::iterator it = srcSet.begin(); it != srcSet.end(); ++it) {
+        ObjectAccInfo* srcObjAccInfo = *it;
+        for(unsigned int i = 0; i < srcObjAccInfo->trackSet.size(); i++) {
+            if(srcObjAccInfo->trackSet[i] == NULL || srcObjAccInfo->trackSet[i]->size() == 0) {
+                continue;
+            }
+            ObjectAccInfo* dstObjAccInfo = (*addrMap)[srcObjAccInfo];
+            if(dstObjAccInfo->trackSet[i] == NULL) {
+                dstObjAccInfo->trackSet[i] = new std::set<ObjectAccInfo*>();
+            }
+            for(std::set<ObjectAccInfo*>::iterator trkit = srcObjAccInfo->trackSet[i]->begin(); trkit != srcObjAccInfo->trackSet[i]->end(); ++trkit) {
+                if((*addrMap).find(*trkit) == (*addrMap).end()) {
+                    // first check if there is an objectAccInfo in dst track which is not from an field set
+                    handleUnmatchTrack(dstObjAccInfo->trackSet[i], *trkit, addrMap, fieldAccSet);
+                }
+                dstObjAccInfo->trackSet[i]->insert((*addrMap)[*trkit]);
+            }
+        }
+    }
+}
+/*
+static void unionObjectTrackInfo(ObjectAccInfo* dstObjAccInfo, ObjectAccInfo* srcObjAccInfo, std::map<ObjectAccInfo*, ObjectAccInfo*>* addrMap, std::set<ObjectAccInfo*>* fieldAccSet) {
     for(unsigned int i = 0; i < srcObjAccInfo->trackSet.size(); i++) {
         if(dstObjAccInfo->fieldSet[i] != NULL && srcObjAccInfo->fieldSet[i] != NULL) {
-            unionObjectTrackInfo(dstObjAccInfo->fieldSet[i], srcObjAccInfo->fieldSet[i], addrMap);
+            unionObjectTrackInfo(dstObjAccInfo->fieldSet[i], srcObjAccInfo->fieldSet[i], addrMap, fieldAccSet);
         }
         if(srcObjAccInfo->trackSet[i] == NULL || srcObjAccInfo->trackSet[i]->size() == 0) {
             continue;
         }
         if(dstObjAccInfo->trackSet[i] == NULL) {
-            dstObjAccInfo->trackSet[i] = new std::vector<ObjectAccInfo*>();
+            dstObjAccInfo->trackSet[i] = new std::set<ObjectAccInfo*>();
         }
-        for(unsigned int j = 0; j < srcObjAccInfo->trackSet[i]->size(); j++) {
-            if((*addrMap)[srcObjAccInfo->trackSet[i]->at(j)] == NULL) {
-                createMatchTrack(srcObjAccInfo->trackSet[i]->at(j), addrMap);
+        for(std::set<ObjectAccInfo*>::iterator it = srcObjAccInfo->trackSet[i]->begin(); it != srcObjAccInfo->trackSet[i]->end(); ++it) {
+            if((*addrMap).find(*it) == (*addrMap).end()) {
+                // first check if there is an objectAccInfo in dst track which is not from an field set
+                handleUnmatchTrack(dstObjAccInfo->trackSet[i], *it, addrMap, fieldAccSet);
             }
-            pushSingle(dstObjAccInfo->trackSet[i], (*addrMap)[srcObjAccInfo->trackSet[i]->at(j)]);
+            dstObjAccInfo->trackSet[i]->insert((*addrMap)[*it]);
         }
-        if(dstObjAccInfo->trackSet[i]->size() > 100) {
-            ALOGE("union track get a large size: %u, the src size is: %u", dstObjAccInfo->trackSet[i]->size(), srcObjAccInfo->trackSet[i]->size());
-        }
+        //if(dstObjAccInfo->trackSet[i]->size() > 100) {
+        //    ALOGE("union track get a large size: %u, the src size is: %u", dstObjAccInfo->trackSet[i]->size(), srcObjAccInfo->trackSet[i]->size());
+        //}
     }
-}
+}*/
 
-void unionClazzFieldInfo(MethodAccInfo* dstAccInfo, MethodAccInfo* srcAccInfo, std::map<ObjectAccInfo*, ObjectAccInfo*>* addrMap) {
+static void unionClazzFieldInfo(MethodAccInfo* dstAccInfo, MethodAccInfo* srcAccInfo, std::map<ObjectAccInfo*, ObjectAccInfo*>* addrMap, bool isDstBranch) {
     for(unsigned int i = 0; i < srcAccInfo->globalClazz->size(); i++) {
         unsigned int j;
         for(j = 0; j < dstAccInfo->globalClazz->size(); j++) {
@@ -525,11 +552,11 @@ void unionClazzFieldInfo(MethodAccInfo* dstAccInfo, MethodAccInfo* srcAccInfo, s
             dstAccInfo->globalClazz->push_back(new ClazzAccInfo());
             dstAccInfo->globalClazz->at(j)->clazz = srcAccInfo->globalClazz->at(i)->clazz;
         }
-        unionObjectFieldInfo(dstAccInfo->globalClazz->at(j), srcAccInfo->globalClazz->at(i), addrMap);
+        unionObjectFieldInfo(dstAccInfo->globalClazz->at(j), srcAccInfo->globalClazz->at(i), addrMap, isDstBranch);
     }
 }
-
-void unionClazzTrackInfo(MethodAccInfo* dstAccInfo, MethodAccInfo* srcAccInfo, std::map<ObjectAccInfo*, ObjectAccInfo*>* addrMap) {
+/*
+static void unionClazzTrackInfo(MethodAccInfo* dstAccInfo, MethodAccInfo* srcAccInfo, std::map<ObjectAccInfo*, ObjectAccInfo*>* addrMap, std::set<ObjectAccInfo*>* fieldAccSet) {
     for(unsigned int i = 0; i < srcAccInfo->globalClazz->size(); i++) {
         unsigned int j;
         for(j = 0; j < dstAccInfo->globalClazz->size(); j++) {
@@ -537,43 +564,72 @@ void unionClazzTrackInfo(MethodAccInfo* dstAccInfo, MethodAccInfo* srcAccInfo, s
                 break;
             }
         }
-        unionObjectTrackInfo(dstAccInfo->globalClazz->at(j), srcAccInfo->globalClazz->at(i), addrMap);
+        unionObjectTrackInfo(dstAccInfo->globalClazz->at(j), srcAccInfo->globalClazz->at(i), addrMap, fieldAccSet);
     }
-}
+}*/
 
-void unionReturnObjs(MethodAccInfo* dstAccInfo, MethodAccInfo* srcAccInfo, std::map<ObjectAccInfo*, ObjectAccInfo*>* addrMap) {
+static void unionReturnObjs(MethodAccInfo* dstAccInfo, MethodAccInfo* srcAccInfo, std::map<ObjectAccInfo*, ObjectAccInfo*>* addrMap) {
     if(srcAccInfo->returnObjs == NULL || srcAccInfo->returnObjs->size() == 0) {
         return;
     }
     if(dstAccInfo->returnObjs == NULL) {
-        dstAccInfo->returnObjs = new std::vector<ObjectAccInfo*>();
+        dstAccInfo->returnObjs = new std::set<ObjectAccInfo*>();
     }
-    for(unsigned int i = 0; i < srcAccInfo->returnObjs->size(); i++) {
-        pushSingle(dstAccInfo->returnObjs, (*addrMap)[srcAccInfo->returnObjs->at(i)]);
+    for(std::set<ObjectAccInfo*>::iterator it = srcAccInfo->returnObjs->begin(); it != srcAccInfo->returnObjs->end(); ++it) {
+        if((*addrMap).find(*it) == (*addrMap).end()) {
+            createMatchTrack(*it, addrMap);
+        }
+        dstAccInfo->returnObjs->insert((*addrMap)[*it]);
     }
+}
+
+static void getFieldAccSet(MethodAccInfo* methodAccInfo, std::set<ObjectAccInfo*>* fieldAccSet) {
+    std::vector<ObjectAccInfo*> processList;
+    for(unsigned int i = 0; i < methodAccInfo->args->size(); i++) {
+        processList.push_back(methodAccInfo->args->at(i));
+    }
+    for(unsigned int i = 0; i < methodAccInfo->globalClazz->size(); i++) {
+        processList.push_back(methodAccInfo->globalClazz->at(i));
+    }
+    for(unsigned int i = 0; i < processList.size(); i++) {
+        fieldAccSet->insert(processList[i]);
+        for(unsigned int j = 0; j < processList[i]->fieldSet.size(); j++) {
+            if(processList[i]->fieldSet[j] != NULL) {
+                processList.push_back(processList[i]->fieldSet[j]);
+            }
+        }
+    }
+}
+
+static void unionMethodAccInfo(MethodAccInfo* dstAccInfo, MethodAccInfo* srcAccInfo, std::map<ObjectAccInfo*, ObjectAccInfo*>* addrMap, bool isDstBranch) {
+    // union the field access info for each args
+    for(unsigned int i = 0; i < srcAccInfo->args->size(); i++) {
+        unionObjectFieldInfo(dstAccInfo->args->at(i), srcAccInfo->args->at(i), addrMap, isDstBranch);
+    }
+    // union the class field access info for each class
+    unionClazzFieldInfo(dstAccInfo, srcAccInfo, addrMap, isDstBranch);
+    // find out all the object which is in the fieldSet of args and clazz recursively
+    std::set<ObjectAccInfo*> fieldAccSet;
+    getFieldAccSet(dstAccInfo, &fieldAccSet);
+    // union the field track info for each args
+    unionTracks(addrMap, &fieldAccSet);
+    /*for(unsigned int i = 0; i < srcAccInfo->args->size(); i++) {
+        unionObjectTrackInfo(dstAccInfo->args->at(i), srcAccInfo->args->at(i), addrMap, &fieldAccSet);
+    }*/
+    // union the class field track info for each class
+    //unionClazzTrackInfo(dstAccInfo, srcAccInfo, addrMap, &fieldAccSet);
+    // union the return objects
+    unionReturnObjs(dstAccInfo, srcAccInfo, addrMap);
 }
 
 /* Union the two method access info into the dstAccInfo */
-void unionMethodAccInfo(MethodAccInfo* dstAccInfo, MethodAccInfo* srcAccInfo) {
+static void unionMethodAccInfo(MethodAccInfo* dstAccInfo, MethodAccInfo* srcAccInfo, bool isDstBranch) {
     //ALOGE("union method info: %p - %s.%s, sub method is: %p - %s.%s", dstAccInfo->method, dstAccInfo->method->clazz->descriptor, dstAccInfo->method->name, srcAccInfo->method, srcAccInfo->method->clazz->descriptor, srcAccInfo->method->name);
     std::map<ObjectAccInfo*, ObjectAccInfo*> addrMap;
-    // union the field access info for each args
-    for(unsigned int i = 0; i < srcAccInfo->args->size(); i++) {
-        unionObjectFieldInfo(dstAccInfo->args->at(i), srcAccInfo->args->at(i), &addrMap);
-    }
-    // union the class field access info for each class
-    unionClazzFieldInfo(dstAccInfo, srcAccInfo, &addrMap);
-    // union the field track info for each args
-    for(unsigned int i = 0; i < srcAccInfo->args->size(); i++) {
-        unionObjectTrackInfo(dstAccInfo->args->at(i), srcAccInfo->args->at(i), &addrMap);
-    }
-    // union the class field track info for each class
-    unionClazzTrackInfo(dstAccInfo, srcAccInfo, &addrMap);
-    // union the return objects
-    unionReturnObjs(dstAccInfo, srcAccInfo, &addrMap);
+    unionMethodAccInfo(dstAccInfo, srcAccInfo, &addrMap, isDstBranch);
 }
 
-void mergeObjectAccFieldInfo(std::vector<ObjectAccInfo*>* dstAccInfoList, ObjectAccInfo* srcAccInfo, std::map<ObjectAccInfo*, std::vector<ObjectAccInfo*> >* addrMap) {
+static void mergeObjectAccFieldInfo(std::set<ObjectAccInfo*>* dstAccInfoList, ObjectAccInfo* srcAccInfo, std::map<ObjectAccInfo*, std::set<ObjectAccInfo*> >* addrMap) {
     (*addrMap)[srcAccInfo] = *dstAccInfoList;
     if(srcAccInfo->inArray) {
         flagVecAllArray(dstAccInfoList);
@@ -582,40 +638,48 @@ void mergeObjectAccFieldInfo(std::vector<ObjectAccInfo*>* dstAccInfoList, Object
             flagVecAll(dstAccInfoList);
         }    
     }
-    for(unsigned int i = 0; i < dstAccInfoList->size(); i++) {
-        if(dstAccInfoList->at(i)->fieldSet.size() < srcAccInfo->fieldSet.size()) {
-            dstAccInfoList->at(i)->fieldSet.resize(srcAccInfo->fieldSet.size());
-            dstAccInfoList->at(i)->trackSet.resize(srcAccInfo->trackSet.size());
+    for(std::set<ObjectAccInfo*>::iterator it = dstAccInfoList->begin(); it != dstAccInfoList->end(); ++it) {
+        if((*it)->fieldSet.size() < srcAccInfo->fieldSet.size()) {
+            (*it)->nullBranchFlags.resize(srcAccInfo->fieldSet.size());
+            (*it)->fieldSet.resize(srcAccInfo->fieldSet.size());
+            (*it)->trackSet.resize(srcAccInfo->trackSet.size());
         }
     }
     for(unsigned int i = 0; i < srcAccInfo->fieldSet.size(); i++) {
         if(srcAccInfo->fieldSet[i] == NULL) {
+            if(srcAccInfo->nullBranchFlags[i]) {
+                for(std::set<ObjectAccInfo*>::iterator it = dstAccInfoList->begin(); it != dstAccInfoList->end(); ++it) {
+                    (*it)->nullBranchFlags[i] = true;
+                }
+            }
             continue;
         }
-        std::vector<ObjectAccInfo*> fieldList;
-        for(unsigned int j = 0; j < dstAccInfoList->size(); j++) {
-            if(dstAccInfoList->at(j)->trackSet[i] == NULL) { // indicates that the field accessed is the original field
-                dstAccInfoList->at(j)->fieldSet[i] = new ObjectAccInfo();
-                dstAccInfoList->at(j)->fieldSet[i]->belonging = dstAccInfoList->at(j);
-                dstAccInfoList->at(j)->trackSet[i] = new std::vector<ObjectAccInfo*>();
-                dstAccInfoList->at(j)->trackSet[i]->push_back(dstAccInfoList->at(j)->fieldSet[i]);
-                fieldList.push_back(dstAccInfoList->at(j)->fieldSet[i]);
+        std::set<ObjectAccInfo*> fieldList;
+        for(std::set<ObjectAccInfo*>::iterator it = dstAccInfoList->begin(); it != dstAccInfoList->end(); ++it) {
+            if((unsigned int)(srcAccInfo->fieldSet[i]) == 0x46b415e8) {
+                ALOGE("find the specified address parsing, dst addr: %p", *it);
+            }
+            if((*it)->trackSet[i] == NULL) { // indicates that the field accessed is the original field
+                (*it)->fieldSet[i] = new ObjectAccInfo();
+                (*it)->fieldSet[i]->belonging = *it;
+                (*it)->trackSet[i] = new std::set<ObjectAccInfo*>();
+                (*it)->trackSet[i]->insert((*it)->fieldSet[i]);
+                fieldList.insert((*it)->fieldSet[i]);
             } else {
-                pushVec(&fieldList, dstAccInfoList->at(j)->trackSet[i]);
+                fieldList.insert((*it)->trackSet[i]->begin(), (*it)->trackSet[i]->end());
             }
         }
         mergeObjectAccFieldInfo(&fieldList, srcAccInfo->fieldSet[i], addrMap);
     }
 }
 
-void mergeObjectAccTrackInfo(std::vector<ObjectAccInfo*>* dstAccInfoList, ObjectAccInfo* srcAccInfo, std::map<ObjectAccInfo*, std::vector<ObjectAccInfo*> >* addrMap, std::map<ObjectAccInfo*, ObjectAccInfo*>* changeCache);
+void mergeObjectAccTrackInfo(std::set<ObjectAccInfo*>* dstAccInfoList, ObjectAccInfo* srcAccInfo, std::map<ObjectAccInfo*, std::set<ObjectAccInfo*> >* addrMap, std::set<ObjectAccInfo*>* changeCache, std::set<ObjectAccInfo*>* fieldAccSet);
 
-
-void createVecMatchTrack(ObjectAccInfo* srcTrackObj, std::map<ObjectAccInfo*, std::vector<ObjectAccInfo*> >* addrMap) {
+static void createVecMatchTrack(ObjectAccInfo* srcTrackObj, std::map<ObjectAccInfo*, std::set<ObjectAccInfo*> >* addrMap) {
     // indicates that in the iput, only the vdst is in the interest, we make a new corresponding object
-    std::vector<ObjectAccInfo*> result;
+    std::set<ObjectAccInfo*> result;
     ObjectAccInfo* newAccInfo = new ObjectAccInfo();
-    result.push_back(newAccInfo);
+    result.insert(newAccInfo);
     (*addrMap)[srcTrackObj] = result;
     if(srcTrackObj->allFlag) {
         newAccInfo->allFlag = true;
@@ -623,6 +687,7 @@ void createVecMatchTrack(ObjectAccInfo* srcTrackObj, std::map<ObjectAccInfo*, st
     if(srcTrackObj->inArray) {
         newAccInfo->inArray = true;
     }
+    newAccInfo->nullBranchFlags.resize(srcTrackObj->fieldSet.size());
     newAccInfo->fieldSet.resize(srcTrackObj->fieldSet.size());
     newAccInfo->trackSet.resize(srcTrackObj->trackSet.size());
     newAccInfo->mergeSet.resize(srcTrackObj->trackSet.size());
@@ -630,62 +695,177 @@ void createVecMatchTrack(ObjectAccInfo* srcTrackObj, std::map<ObjectAccInfo*, st
         if(srcTrackObj->trackSet[i] == NULL) {
             continue;
         }
-        newAccInfo->trackSet[i] = new std::vector<ObjectAccInfo*>();
-        for(unsigned int j = 0; j < srcTrackObj->trackSet[i]->size(); j++) {
-            if((*addrMap).find(srcTrackObj->trackSet[i]->at(j)) == (*addrMap).end()) {
-                createVecMatchTrack(srcTrackObj->trackSet[i]->at(j), addrMap);
+        newAccInfo->trackSet[i] = new std::set<ObjectAccInfo*>();
+        for(std::set<ObjectAccInfo*>::iterator it = srcTrackObj->trackSet[i]->begin(); it != srcTrackObj->trackSet[i]->end(); ++it) {
+            if((*addrMap).find(*it) == (*addrMap).end()) {
+                createVecMatchTrack(*it, addrMap);
             }
-            newAccInfo->trackSet[i]->insert(newAccInfo->trackSet[i]->end(), (*addrMap)[srcTrackObj->trackSet[i]->at(j)].begin(), (*addrMap)[srcTrackObj->trackSet[i]->at(j)].end());
+            newAccInfo->trackSet[i]->insert((*addrMap)[*it].begin(), (*addrMap)[*it].end());
         }
     }
 }
 
-void mergeObjectTrack(ObjectAccInfo* dstAccInfo, ObjectAccInfo* srcAccInfo, std::map<ObjectAccInfo*, std::vector<ObjectAccInfo*> >* addrMap, std::map<ObjectAccInfo*, ObjectAccInfo*>* changeCache) {
+static std::set<ObjectAccInfo*>* handleUnmatchVecTrack(std::set<ObjectAccInfo*>* dstTrackSet, ObjectAccInfo* srcTrackObj, std::map<ObjectAccInfo*, std::set<ObjectAccInfo*> >* addrMap, std::set<ObjectAccInfo*>* fieldAccSet) {
+    bool isHandled = false;
+    if(dstTrackSet != NULL) {
+        for(std::set<ObjectAccInfo*>::iterator it = dstTrackSet->begin(); it != dstTrackSet->end(); ++it) {
+            if(fieldAccSet->find(*it) == fieldAccSet->end()) {
+                isHandled = true;
+                std::set<ObjectAccInfo*>* tempMapping = new std::set<ObjectAccInfo*>();
+                tempMapping->insert(*it);
+                (*addrMap)[srcTrackObj] = *tempMapping;
+                (*it)->allFlag = (*it)->allFlag || srcTrackObj->allFlag;
+                (*it)->inArray = (*it)->inArray || srcTrackObj->inArray;
+                if((*it)->trackSet.size() < srcTrackObj->trackSet.size()) {
+                    (*it)->nullBranchFlags.resize(srcTrackObj->nullBranchFlags.size());
+                    (*it)->fieldSet.resize(srcTrackObj->fieldSet.size());
+                    (*it)->trackSet.resize(srcTrackObj->trackSet.size());
+                    (*it)->mergeSet.resize(srcTrackObj->trackSet.size());
+                }
+                for(unsigned int i = 0; i < srcTrackObj->trackSet.size(); i++) {
+                    if(srcTrackObj->trackSet[i] == NULL || srcTrackObj->trackSet[i]->empty()) {
+                        continue;
+                    }
+                    if((*it)->trackSet[i] == NULL) {
+                        (*it)->trackSet[i] = new std::set<ObjectAccInfo*>();
+                    }
+                    for(std::set<ObjectAccInfo*>::iterator tit = srcTrackObj->trackSet[i]->begin(); tit != srcTrackObj->trackSet[i]->end(); ++tit) {
+                        if((*addrMap).find(*tit) == (*addrMap).end()) {
+                            std::set<ObjectAccInfo*>* currentTrack;
+                            currentTrack = handleUnmatchVecTrack((*it)->trackSet[i], *tit, addrMap, fieldAccSet);
+                            if(currentTrack == NULL) { // indicates that it comes from the method of createVecMatchTrack
+                                (*it)->trackSet[i]->insert((*addrMap)[*tit].begin(), (*addrMap)[*tit].end());
+                            } else {
+                                (*it)->trackSet[i]->insert(currentTrack->begin(), currentTrack->end());
+                                delete currentTrack;
+                            }
+                        } else {
+                            (*it)->trackSet[i]->insert((*addrMap)[*tit].begin(), (*addrMap)[*tit].end());
+                        }
+                    }
+                }
+                addrMap->erase(srcTrackObj);
+                return tempMapping;
+            }
+        }
+    }
+    if(!isHandled) {
+        createVecMatchTrack(srcTrackObj, addrMap);
+    }
+    return NULL;
+}
+
+static void mergeTracks(std::map<ObjectAccInfo*, std::set<ObjectAccInfo*> >* addrMap, std::set<ObjectAccInfo*>* changeCache, std::set<ObjectAccInfo*>* fieldAccSet) {
+    // addr should have all the mapping between dst and src already
+    std::set<ObjectAccInfo*> srcSet;
+    for(std::map<ObjectAccInfo*, std::set<ObjectAccInfo*> >::iterator it = addrMap->begin(); it != addrMap->end(); ++it) {
+        srcSet.insert(it->first);
+    }
+    for(std::set<ObjectAccInfo*>::iterator it = srcSet.begin(); it != srcSet.end(); ++it) {
+        ObjectAccInfo* srcAccInfo = *it;
+        for(unsigned int i = 0; i < srcAccInfo->trackSet.size(); i++) {
+            if(srcAccInfo->trackSet[i] == NULL || srcAccInfo->trackSet[i]->size() == 0) {
+                continue;
+            }
+            changeCache->insert((*addrMap)[srcAccInfo].begin(), (*addrMap)[srcAccInfo].end());
+            for(std::set<ObjectAccInfo*>::iterator dstit = (*addrMap)[srcAccInfo].begin(); dstit != (*addrMap)[srcAccInfo].end(); ++dstit) {
+                ObjectAccInfo* dstAccInfo = *dstit;
+                dstAccInfo->mergeSet.resize(dstAccInfo->trackSet.size());
+                // indicates that the one in the track should not change, there is no assign to the track
+                if(srcAccInfo->trackSet[i]->size() == 1 && srcAccInfo->trackSet[i]->find(srcAccInfo->fieldSet[i]) != srcAccInfo->trackSet[i]->end()) {
+                    if(dstAccInfo->trackSet[i] == NULL) {
+                        dstAccInfo->trackSet[i] = new std::set<ObjectAccInfo*>();
+                        dstAccInfo->trackSet[i]->insert(dstAccInfo->fieldSet[i]);
+                    }
+                    if(dstAccInfo->mergeSet[i] == NULL) {
+                        dstAccInfo->mergeSet[i] = new std::set<ObjectAccInfo*>();
+                    }
+                    dstAccInfo->mergeSet[i]->insert(dstAccInfo->trackSet[i]->begin(), dstAccInfo->trackSet[i]->end());
+                    continue;
+                }
+                if(dstAccInfo->mergeSet[i] == NULL) {
+                    dstAccInfo->mergeSet[i] = new std::set<ObjectAccInfo*>();
+                    // if the subAccInfo has a null branch, we should retain the previous track set of the object
+                    if(srcAccInfo->nullBranchFlags[i] && dstAccInfo->trackSet[i] != NULL) {
+                        dstAccInfo->mergeSet[i]->insert(dstAccInfo->trackSet[i]->begin(), dstAccInfo->trackSet[i]->end());
+                    }
+                }
+                for(std::set<ObjectAccInfo*>::iterator trkit = srcAccInfo->trackSet[i]->begin(); trkit != srcAccInfo->trackSet[i]->end(); ++trkit) {
+                    if((*addrMap).find(*trkit) == (*addrMap).end()) {
+                        std::set<ObjectAccInfo*>* currentTrack;
+                        currentTrack = handleUnmatchVecTrack(dstAccInfo->trackSet[i], *trkit, addrMap, fieldAccSet);
+                        if(currentTrack == NULL) { // indicates that it comes from the method of createVecMatchTrack
+                            dstAccInfo->mergeSet[i]->insert((*addrMap)[*trkit].begin(), (*addrMap)[*trkit].end());
+                        } else {
+                            dstAccInfo->mergeSet[i]->insert(currentTrack->begin(), currentTrack->end());
+                            delete currentTrack;
+                        }
+                    } else {
+                        dstAccInfo->mergeSet[i]->insert((*addrMap)[*trkit].begin(), (*addrMap)[*trkit].end());
+                    }
+                }
+            }
+        }
+    }
+}
+/*
+static void mergeObjectTrack(ObjectAccInfo* dstAccInfo, ObjectAccInfo* srcAccInfo, std::map<ObjectAccInfo*, std::set<ObjectAccInfo*> >* addrMap, std::set<ObjectAccInfo*>* changeCache, std::set<ObjectAccInfo*>* fieldAccSet) {
     //pushSingle(changeCache, dstAccInfo);
-    if(changeCache->find(dstAccInfo) != changeCache->end()) {
-        (*changeCache)[dstAccInfo] = dstAccInfo;
-    }
-    if(dstAccInfo->mergeSet.size() < dstAccInfo->trackSet.size()) {
-        dstAccInfo->mergeSet.resize(dstAccInfo->trackSet.size());
-    }
+    changeCache->insert(dstAccInfo);
+    dstAccInfo->mergeSet.resize(dstAccInfo->trackSet.size());
     for(unsigned int i = 0; i < srcAccInfo->trackSet.size(); i++) {
         if(srcAccInfo->fieldSet[i] != NULL) {
-            mergeObjectAccTrackInfo(dstAccInfo->trackSet[i], srcAccInfo->fieldSet[i], addrMap, changeCache);
+            if((unsigned int)(srcAccInfo->fieldSet[i]) == 0x46b415e8) {
+                ALOGE("in track specified address parsing, dst addr: %p", dstAccInfo);
+            }
+            mergeObjectAccTrackInfo(dstAccInfo->trackSet[i], srcAccInfo->fieldSet[i], addrMap, changeCache, fieldAccSet);
         }
         if(srcAccInfo->trackSet[i] == NULL || srcAccInfo->trackSet[i]->size() == 0) {
             continue;
         }
-        if(srcAccInfo->trackSet[i]->size() == 1 && srcAccInfo->trackSet[i]->at(0) == srcAccInfo->fieldSet[i]) {
+        if(srcAccInfo->trackSet[i]->size() == 1 && srcAccInfo->trackSet[i]->find(srcAccInfo->fieldSet[i]) != srcAccInfo->trackSet[i]->end()) {
             // indicates that the one in the track should not change, there is no assign to the track
             if(dstAccInfo->trackSet[i] == NULL) {
-                dstAccInfo->trackSet[i] = new std::vector<ObjectAccInfo*>();
-                dstAccInfo->trackSet[i]->push_back(dstAccInfo->fieldSet[i]);
+                dstAccInfo->trackSet[i] = new std::set<ObjectAccInfo*>();
+                dstAccInfo->trackSet[i]->insert(dstAccInfo->fieldSet[i]);
             }
             if(dstAccInfo->mergeSet[i] == NULL) {
-                dstAccInfo->mergeSet[i] = new std::vector<ObjectAccInfo*>();
+                dstAccInfo->mergeSet[i] = new std::set<ObjectAccInfo*>();
             }
-            pushVec(dstAccInfo->mergeSet[i], dstAccInfo->trackSet[i]);
+            dstAccInfo->mergeSet[i]->insert(dstAccInfo->trackSet[i]->begin(), dstAccInfo->trackSet[i]->end());
             continue;
         }
         if(dstAccInfo->mergeSet[i] == NULL) {
-            dstAccInfo->mergeSet[i] = new std::vector<ObjectAccInfo*>();
-        }
-        for(unsigned int j = 0; j < srcAccInfo->trackSet[i]->size(); j++) {
-            if((*addrMap).find(srcAccInfo->trackSet[i]->at(j)) == (*addrMap).end()) {
-                createVecMatchTrack(srcAccInfo->trackSet[i]->at(j), addrMap);
+            dstAccInfo->mergeSet[i] = new std::set<ObjectAccInfo*>();
+            // if the subAccInfo has a null branch, we should retain the previous track set of the object
+            if(srcAccInfo->nullBranchFlags[i] && dstAccInfo->trackSet[i] != NULL) {
+                dstAccInfo->mergeSet[i]->insert(dstAccInfo->trackSet[i]->begin(), dstAccInfo->trackSet[i]->end());
             }
-            pushVec(dstAccInfo->mergeSet[i], &((*addrMap)[srcAccInfo->trackSet[i]->at(j)]));
+        }
+        for(std::set<ObjectAccInfo*>::iterator it = srcAccInfo->trackSet[i]->begin(); it != srcAccInfo->trackSet[i]->end(); ++it) {
+            if((*addrMap).find(*it) == (*addrMap).end()) {
+                std::set<ObjectAccInfo*>* currentTrack;
+                currentTrack = handleUnmatchVecTrack(dstAccInfo->trackSet[i], *it, addrMap, fieldAccSet);
+                if(currentTrack == NULL) { // indicates that it comes from the method of createVecMatchTrack
+                    dstAccInfo->mergeSet[i]->insert((*addrMap)[*it].begin(), (*addrMap)[*it].end());
+                } else {
+                    dstAccInfo->mergeSet[i]->insert(currentTrack->begin(), currentTrack->end());
+                    delete currentTrack;
+                }
+            } else {
+                dstAccInfo->mergeSet[i]->insert((*addrMap)[*it].begin(), (*addrMap)[*it].end());
+            }
         }
     }
 }
 
-void mergeObjectAccTrackInfo(std::vector<ObjectAccInfo*>* dstAccInfoList, ObjectAccInfo* srcAccInfo, std::map<ObjectAccInfo*, std::vector<ObjectAccInfo*> >* addrMap, std::map<ObjectAccInfo*, ObjectAccInfo*>* changeCache) {
-    for(unsigned int i = 0; i < dstAccInfoList->size(); i++) {
-        mergeObjectTrack(dstAccInfoList->at(i), srcAccInfo, addrMap, changeCache);
+void mergeObjectAccTrackInfo(std::set<ObjectAccInfo*>* dstAccInfoList, ObjectAccInfo* srcAccInfo, std::map<ObjectAccInfo*, std::set<ObjectAccInfo*> >* addrMap, std::set<ObjectAccInfo*>* changeCache, std::set<ObjectAccInfo*>* fieldAccSet) {
+    for(std::set<ObjectAccInfo*>::iterator it = dstAccInfoList->begin(); it != dstAccInfoList->end(); ++it) {
+        mergeObjectTrack(*it, srcAccInfo, addrMap, changeCache, fieldAccSet);
     }
-}
+}*/
 
-void mergeGlobalClazzField(MethodAccInfo* methodAccInfo, MethodAccInfo* subAccInfo, std::map<ObjectAccInfo*, std::vector<ObjectAccInfo*> >* addrMap) {
+static void mergeGlobalClazzField(MethodAccInfo* methodAccInfo, MethodAccInfo* subAccInfo, std::map<ObjectAccInfo*, std::set<ObjectAccInfo*> >* addrMap) {
     for(unsigned int i = 0; i < subAccInfo->globalClazz->size(); i++) {
         unsigned int j;
         for(j = 0; j < methodAccInfo->globalClazz->size(); j++) {
@@ -697,13 +877,13 @@ void mergeGlobalClazzField(MethodAccInfo* methodAccInfo, MethodAccInfo* subAccIn
             methodAccInfo->globalClazz->push_back(new ClazzAccInfo());
             methodAccInfo->globalClazz->at(j)->clazz = subAccInfo->globalClazz->at(i)->clazz;
         }
-        std::vector<ObjectAccInfo*> argVec;
-        argVec.push_back(methodAccInfo->globalClazz->at(j));
+        std::set<ObjectAccInfo*> argVec;
+        argVec.insert(methodAccInfo->globalClazz->at(j));
         mergeObjectAccFieldInfo(&argVec, subAccInfo->globalClazz->at(i), addrMap);
     }
 }
 
-void mergeGlobalClazzTrack(MethodAccInfo* methodAccInfo, MethodAccInfo* subAccInfo, std::map<ObjectAccInfo*, std::vector<ObjectAccInfo*> >* addrMap, std::map<ObjectAccInfo*, ObjectAccInfo*>* changeCache) {
+/*static void mergeGlobalClazzTrack(MethodAccInfo* methodAccInfo, MethodAccInfo* subAccInfo, std::map<ObjectAccInfo*, std::set<ObjectAccInfo*> >* addrMap, std::set<ObjectAccInfo*>* changeCache, std::set<ObjectAccInfo*>* fieldAccSet) {
     for(unsigned int i = 0; i < subAccInfo->globalClazz->size(); i++) {
         unsigned int j;
         for(j = 0; j < methodAccInfo->globalClazz->size(); j++) {
@@ -711,22 +891,25 @@ void mergeGlobalClazzTrack(MethodAccInfo* methodAccInfo, MethodAccInfo* subAccIn
                 break;
             }
         }
-        mergeObjectTrack(methodAccInfo->globalClazz->at(j), subAccInfo->globalClazz->at(i), addrMap, changeCache);
+        mergeObjectTrack(methodAccInfo->globalClazz->at(j), subAccInfo->globalClazz->at(i), addrMap, changeCache, fieldAccSet);
     }
-}
+}*/
 
-void mergeMethodReturnInfo(MethodAccInfo* methodAccInfo, MethodAccInfo* subAccInfo, std::map<ObjectAccInfo*, std::vector<ObjectAccInfo*> >* addrMap) {
+static void mergeMethodReturnInfo(MethodAccInfo* methodAccInfo, MethodAccInfo* subAccInfo, std::map<ObjectAccInfo*, std::set<ObjectAccInfo*> >* addrMap) {
     if(subAccInfo->returnObjs == NULL || subAccInfo->returnObjs->size() == 0) {
         return;
     }
-    methodAccInfo->curMethodReturns = new std::vector<ObjectAccInfo*>();
-    for(unsigned int i = 0; i < subAccInfo->returnObjs->size(); i++) {
-        pushVec(methodAccInfo->curMethodReturns, &((*addrMap)[subAccInfo->returnObjs->at(i)]));
+    methodAccInfo->curMethodReturns = new std::set<ObjectAccInfo*>();
+    for(std::set<ObjectAccInfo*>::iterator it = subAccInfo->returnObjs->begin(); it != subAccInfo->returnObjs->end(); ++it) {
+        if((*addrMap).find(*it) == (*addrMap).end()) {
+            createVecMatchTrack(*it, addrMap);
+        }
+        methodAccInfo->curMethodReturns->insert(((*addrMap)[*it]).begin(), ((*addrMap)[*it]).end());
     }
 }
 
 /* check if the registers of the method are in our interest */
-bool methodHasInterest(u2 vsrc1, u2 vdst, std::map<u2, std::vector<ObjectAccInfo*> >* interestRegObjMap) {
+static bool methodHasInterest(u2 vsrc1, u2 vdst, std::map<u2, std::set<ObjectAccInfo*> >* interestRegObjMap) {
     u4 count = vsrc1 >> 4;
     u2 reg;
     bool hasInterest = false;
@@ -768,7 +951,7 @@ bool methodHasInterest(u2 vsrc1, u2 vdst, std::map<u2, std::vector<ObjectAccInfo
 }
 
 /* flag the interest registers of the method as migrating all */
-void methodRegsFlagAll(u2 vsrc1, u2 vdst, std::map<u2, std::vector<ObjectAccInfo*> >* interestRegObjMap) {
+static void methodRegsFlagAll(u2 vsrc1, u2 vdst, std::map<u2, std::set<ObjectAccInfo*> >* interestRegObjMap) {
     u4 count = vsrc1 >> 4;
     u2 reg;
     switch (count) {
@@ -802,15 +985,21 @@ void methodRegsFlagAll(u2 vsrc1, u2 vdst, std::map<u2, std::vector<ObjectAccInfo
     }
 }
 
-void applyMergeToTrack(std::map<ObjectAccInfo*, ObjectAccInfo*>* changeCache) {
-    for (std::map<ObjectAccInfo*, ObjectAccInfo*>::iterator it = changeCache->begin(); it != changeCache->end(); ++it) {
-        ObjectAccInfo* objAccInfo = it->second;
+static void applyMergeToTrack(std::set<ObjectAccInfo*>* changeCache) {
+    for (std::set<ObjectAccInfo*>::iterator it = changeCache->begin(); it != changeCache->end(); ++it) {
+        ObjectAccInfo* objAccInfo = *it;
         if(objAccInfo->mergeSet.size() == 0) {
             // indicates we have processed this obj in previous iteration
             continue;
         }
+        if(objAccInfo->mergeSet.size() != objAccInfo->trackSet.size()) {
+            ALOGE("the size of merge is: %u, track is: %u", objAccInfo->mergeSet.size(), objAccInfo->trackSet.size());
+        }
         assert(objAccInfo->mergeSet.size() == objAccInfo->trackSet.size());
         for(unsigned int j = 0; j < objAccInfo->trackSet.size(); j++) {
+            if(objAccInfo->mergeSet[j] == NULL) {
+                continue;
+            }
             if(objAccInfo->trackSet[j] != NULL) {
                 delete objAccInfo->trackSet[j];
             }
@@ -822,10 +1011,10 @@ void applyMergeToTrack(std::map<ObjectAccInfo*, ObjectAccInfo*>* changeCache) {
 }
 
 /* populate the args info for the method */
-void mergeMethodArgs(u2 vsrc1, u2 vdst, std::map<u2, std::vector<ObjectAccInfo*> >* interestRegObjMap, MethodAccInfo* methodAccInfo, MethodAccInfo* subAccInfo) {
+static void mergeMethodArgs(u2 vsrc1, u2 vdst, std::map<u2, std::set<ObjectAccInfo*> >* interestRegObjMap, MethodAccInfo* methodAccInfo, MethodAccInfo* subAccInfo) {
     u4 count = vsrc1 >> 4;
     u2 reg;
-    std::map<ObjectAccInfo*, std::vector<ObjectAccInfo*> > addrMap;
+    std::map<ObjectAccInfo*, std::set<ObjectAccInfo*> > addrMap;
     switch (count) {
     case 5:
         reg = vsrc1 & 0x0f;
@@ -857,45 +1046,48 @@ void mergeMethodArgs(u2 vsrc1, u2 vdst, std::map<u2, std::vector<ObjectAccInfo*>
     }
     // merge global field info
     mergeGlobalClazzField(methodAccInfo, subAccInfo, &addrMap);
-    std::map<ObjectAccInfo*, ObjectAccInfo*>* changeCache = new std::map<ObjectAccInfo*, ObjectAccInfo*>();
-    switch (count) {
+    std::set<ObjectAccInfo*> fieldAccSet;
+    getFieldAccSet(methodAccInfo, &fieldAccSet);
+    std::set<ObjectAccInfo*>* changeCache = new std::set<ObjectAccInfo*>();
+    /*switch (count) {
     case 5:
         reg = vsrc1 & 0x0f;
         if(interestRegObjMap->find(reg) != interestRegObjMap->end()) {
-            mergeObjectAccTrackInfo(&((*interestRegObjMap)[reg]), subAccInfo->args->at(4), &addrMap, changeCache);
+            mergeObjectAccTrackInfo(&((*interestRegObjMap)[reg]), subAccInfo->args->at(4), &addrMap, changeCache, &fieldAccSet);
         }
     case 4:
         reg = vdst >> 12;
         if(interestRegObjMap->find(reg) != interestRegObjMap->end()) {
-            mergeObjectAccTrackInfo(&((*interestRegObjMap)[reg]), subAccInfo->args->at(3), &addrMap, changeCache);
+            mergeObjectAccTrackInfo(&((*interestRegObjMap)[reg]), subAccInfo->args->at(3), &addrMap, changeCache, &fieldAccSet);
         }
     case 3:
         reg = (vdst & 0x0f00) >> 8;
         if(interestRegObjMap->find(reg) != interestRegObjMap->end()) {
-            mergeObjectAccTrackInfo(&((*interestRegObjMap)[reg]), subAccInfo->args->at(2), &addrMap, changeCache);
+            mergeObjectAccTrackInfo(&((*interestRegObjMap)[reg]), subAccInfo->args->at(2), &addrMap, changeCache, &fieldAccSet);
         }
     case 2:
         reg = (vdst & 0x00f0) >> 4;
         if(interestRegObjMap->find(reg) != interestRegObjMap->end()) {
-            mergeObjectAccTrackInfo(&((*interestRegObjMap)[reg]), subAccInfo->args->at(1), &addrMap, changeCache);
+            mergeObjectAccTrackInfo(&((*interestRegObjMap)[reg]), subAccInfo->args->at(1), &addrMap, changeCache, &fieldAccSet);
         }
     case 1:
         reg = vdst & 0x0f;
         if(interestRegObjMap->find(reg) != interestRegObjMap->end()) {
-            mergeObjectAccTrackInfo(&((*interestRegObjMap)[reg]), subAccInfo->args->at(0), &addrMap, changeCache);
+            mergeObjectAccTrackInfo(&((*interestRegObjMap)[reg]), subAccInfo->args->at(0), &addrMap, changeCache, &fieldAccSet);
         }
     default:
         ;
     }
     // merge global track info
-    mergeGlobalClazzTrack(methodAccInfo, subAccInfo, &addrMap, changeCache);
+    mergeGlobalClazzTrack(methodAccInfo, subAccInfo, &addrMap, changeCache, &fieldAccSet);*/
+    mergeTracks(&addrMap, changeCache, &fieldAccSet);
     applyMergeToTrack(changeCache);
     delete changeCache;
     mergeMethodReturnInfo(methodAccInfo, subAccInfo, &addrMap);
 }
 
 /* check if the registers of the range method are in our interest */
-bool rangeMethodHasInterest(u2 vsrc1, u2 vdst, std::map<u2, std::vector<ObjectAccInfo*> >* interestRegObjMap) {
+static bool rangeMethodHasInterest(u2 vsrc1, u2 vdst, std::map<u2, std::set<ObjectAccInfo*> >* interestRegObjMap) {
     bool hasInterest = false;
     for(int i = 0; i < vsrc1; i++) {
         if(interestRegObjMap->find(vdst + i) != interestRegObjMap->end() && !isVecFlagedAll(&((*interestRegObjMap)[vdst + i]))) {
@@ -907,7 +1099,7 @@ bool rangeMethodHasInterest(u2 vsrc1, u2 vdst, std::map<u2, std::vector<ObjectAc
 }
 
 /* flag the interest registers of the range method as migrating all */
-void rangeMethodRegsFlagAll(u2 vsrc1, u2 vdst, std::map<u2, std::vector<ObjectAccInfo*> >* interestRegObjMap) {
+static void rangeMethodRegsFlagAll(u2 vsrc1, u2 vdst, std::map<u2, std::set<ObjectAccInfo*> >* interestRegObjMap) {
     for(int i = 0; i < vsrc1; i++) {
         if(interestRegObjMap->find(vdst + i) != interestRegObjMap->end()) {
             flagVecAll(&((*interestRegObjMap)[vdst + i]));
@@ -916,8 +1108,8 @@ void rangeMethodRegsFlagAll(u2 vsrc1, u2 vdst, std::map<u2, std::vector<ObjectAc
 }
 
 /* populate the args info for the method */
-void mergeRangeMethodArgs(u2 vsrc1, u2 vdst, std::map<u2, std::vector<ObjectAccInfo*> >* interestRegObjMap, MethodAccInfo* methodAccInfo, MethodAccInfo* subAccInfo) {
-    std::map<ObjectAccInfo*, std::vector<ObjectAccInfo*> > addrMap;
+static void mergeRangeMethodArgs(u2 vsrc1, u2 vdst, std::map<u2, std::set<ObjectAccInfo*> >* interestRegObjMap, MethodAccInfo* methodAccInfo, MethodAccInfo* subAccInfo) {
+    std::map<ObjectAccInfo*, std::set<ObjectAccInfo*> > addrMap;
     for(int i = 0; i < vsrc1; i++) {
         if(interestRegObjMap->find(vdst + i) != interestRegObjMap->end()) {
             mergeObjectAccFieldInfo(&((*interestRegObjMap)[vdst + i]), subAccInfo->args->at(i), &addrMap);
@@ -925,14 +1117,17 @@ void mergeRangeMethodArgs(u2 vsrc1, u2 vdst, std::map<u2, std::vector<ObjectAccI
     }
     // merge global field info
     mergeGlobalClazzField(methodAccInfo, subAccInfo, &addrMap);
-    std::map<ObjectAccInfo*, ObjectAccInfo*>* changeCache = new std::map<ObjectAccInfo*, ObjectAccInfo*>();
-    for(int i = 0; i < vsrc1; i++) {
+    std::set<ObjectAccInfo*> fieldAccSet;
+    getFieldAccSet(methodAccInfo, &fieldAccSet);
+    std::set<ObjectAccInfo*>* changeCache = new std::set<ObjectAccInfo*>();
+    /*for(int i = 0; i < vsrc1; i++) {
         if(interestRegObjMap->find(vdst + i) != interestRegObjMap->end()) {
-            mergeObjectAccTrackInfo(&((*interestRegObjMap)[vdst + i]), subAccInfo->args->at(i), &addrMap, changeCache);
+            mergeObjectAccTrackInfo(&((*interestRegObjMap)[vdst + i]), subAccInfo->args->at(i), &addrMap, changeCache, &fieldAccSet);
         }
     }
     // merge global track info
-    mergeGlobalClazzTrack(methodAccInfo, subAccInfo, &addrMap, changeCache);
+    mergeGlobalClazzTrack(methodAccInfo, subAccInfo, &addrMap, changeCache, &fieldAccSet);*/
+    mergeTracks(&addrMap, changeCache, &fieldAccSet);
     applyMergeToTrack(changeCache);
     delete changeCache;
     mergeMethodReturnInfo(methodAccInfo, subAccInfo, &addrMap);
@@ -942,9 +1137,9 @@ void mergeRangeMethodArgs(u2 vsrc1, u2 vdst, std::map<u2, std::vector<ObjectAccI
     
 }*/
 
-void handleCatchBranch(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>* chain, std::vector<int>* insOffsets, std::map<u2, std::vector<ObjectAccInfo*> >* interestRegObjMap, int depth, bool* exitMethod) {
-    Method* method = methodAccInfo->method;
-    int relPc = insns - method->insns;
+int catchBranches = 0;
+static void handleCatchBranch(Method* method, ParseInfo* toParse, std::set<ParseInfo*>* executions) {
+    int relPc = toParse->insoff;
     const DexCode* pCode = dvmGetMethodCode(method);
     DexCatchIterator iterator;
 
@@ -958,262 +1153,176 @@ void handleCatchBranch(const u2* insns, MethodAccInfo* methodAccInfo, std::set<M
             int catchOffset = handler->address;
             // check if the switch case will lead to an instruction cycle
             bool isCycle = false;
-            for(unsigned int i = 0; i < insOffsets->size(); i++) {
-                if(catchOffset == insOffsets->at(i)) {
-                    isCycle = true;
-                    break;
-                }
+            if(toParse->insOffsets->find(catchOffset) != toParse->insOffsets->end()) {
+                isCycle = true;
             }
             if(!isCycle) {
                 // parse the branch taken
-                const u2* temp = method->insns;
-                temp += catchOffset;
-                std::vector<int> tempInsOffsets = *insOffsets;
-                std::map<u2, std::vector<ObjectAccInfo*> > tempInterest = *interestRegObjMap;
-                int newDepth = depth + 1;
-                // If we reach the maximum branch depth, we exit the parse of the method to save the cost of parse
-                if(newDepth >= MaxBranchDepth) {
-                    for(unsigned int i = 0; i < methodAccInfo->args->size(); i++) {
-                        flagObjAll(methodAccInfo->args->at(i));
-                    }
-                    *exitMethod = true;
-                    return;
-                }
-                parseInsns(temp, methodAccInfo, chain, &tempInsOffsets, &tempInterest, newDepth, exitMethod);
+                ParseInfo* catchParseInfo = new ParseInfo();
+                copyParseInfo(toParse, catchParseInfo);
+                catchParseInfo->insoff = catchOffset;
+                executions->insert(catchParseInfo);
+                catchBranches++;
             }
         }
     }
 }
 
-void scanStatic(Method* method, MethodAccInfo* methodAccInfo, std::map<ClassObject*, BitsVec*>* caller, std::set<Method*>* chain) {
-    if(chain->find(method) != chain->end()) {
-        return;
-    }
-    chain->insert(method);
-    std::map<ClassObject*, BitsVec*>* clazzAccMap;
-    if(methodStaticMap.find(method) != methodStaticMap.end()) {
-        clazzAccMap = methodStaticMap[method];
-    } else {
-        clazzAccMap = new std::map<ClassObject*, BitsVec*>();
-        DvmDex* methodClassDex = method->clazz->pDvmDex;
-        const u2* insns = method->insns;
-        int width;
-        u4 ref;
-        Opcode opcode;
-        u4 insnsSize = dvmGetMethodInsnsSize(method);
-        for( ; insnsSize > 0; insns += width, insnsSize -= width) {
-            width = dexGetWidthFromInstruction(insns);
-            opcode = dexOpcodeFromCodeUnit(*insns);
-            if(opcode == OP_SGET_VOLATILE || opcode == OP_SGET_WIDE_VOLATILE || opcode == OP_SGET_OBJECT_VOLATILE
-            || opcode == OP_SGET || opcode == OP_SGET_WIDE || opcode == OP_SGET_OBJECT || opcode == OP_SGET_BOOLEAN
-            || opcode == OP_SGET_BYTE || opcode == OP_SGET_CHAR || opcode == OP_SGET_SHORT) {
-                ref = insns[1];
-                StaticField* sfield = (StaticField*)dvmDexGetResolvedField(methodClassDex, ref);
-                if (sfield == NULL) {
-                    sfield = resolveStaticField(method->clazz, ref);
-                    if(sfield == NULL) { // we should have encountered a wrong version field branch
-                        return;
-                    }
-                }
-                unsigned int offset = sfield - sfield->clazz->sfields;
-                if(clazzAccMap->find(sfield->clazz) == clazzAccMap->end()) {
-                    (*clazzAccMap)[sfield->clazz] = new BitsVec();
-                }
-                BitsVec* bitsvec = (*clazzAccMap)[sfield->clazz];
-                u4 sz = (offset >> 5) + 1;
-                if(bitsvec->size < offset || (bitsvec->size == offset && offset == 0)) {
-                    u4* newbits = (u4*)calloc(sz, 4);
-                    if(bitsvec->bits != NULL) {
-                        memcpy(newbits, bitsvec->bits, ((bitsvec->size >> 5) + 1) << 2);
-                        free(bitsvec->bits);
-                    }
-                    bitsvec->bits = newbits;
-                    bitsvec->size = offset;
-                }
-                bitsvec->bits[sz - 1] = bitsvec->bits[sz - 1] | (1U << (offset & 0x1F));
-            } else if(opcode == OP_INVOKE_VIRTUAL || opcode == OP_INVOKE_VIRTUAL_RANGE) {
-                ref = insns[1];             // method ref
-            
-                int voffset;
-                Method* baseMethod;
-                baseMethod = dvmDexGetResolvedMethod(methodClassDex, ref);
-                if (baseMethod == NULL) {
-                    baseMethod = resolveMethod(method->clazz, ref, METHOD_VIRTUAL);
-                    if(baseMethod == NULL) { // we should have encountered a wrong version method branch
-                        return;
-                    }
-                }
-                bool isLangObjectClass = baseMethod->clazz == javaLangObject;
-                if(isLangObjectClass) {
-                    continue;
-                }
-                voffset = baseMethod->methodIndex;
-                std::vector<ClassObject*>* subclasses = findSubClass(baseMethod->clazz);
-                std::set<Method*> parsedMethod;
-                
-                for(unsigned int idx = 0; idx < subclasses->size(); idx++) {
-                    Method* methodToCall = subclasses->at(idx)->vtable[voffset];
-                    assert(methodToCall != NULL);
-                    if(parsedMethod.find(methodToCall) != parsedMethod.end()) {
-                        continue;
-                    } else {
-                        parsedMethod.insert(methodToCall);
-                    }
-                    scanStatic(methodToCall, methodAccInfo, clazzAccMap, chain);
-                }
-            } else if(opcode == OP_INVOKE_INTERFACE || opcode == OP_INVOKE_INTERFACE_RANGE) { // see Interp.cpp-dvmInterpFindInterfaceMethod
-                ref = insns[1];             // method ref 
-            
-                Method* absMethod;
-                absMethod = dvmDexGetResolvedMethod(methodClassDex, ref);
-                if (absMethod == NULL) {
-                    absMethod = resolveInterfaceMethod(method->clazz, ref);
-                     if(absMethod == NULL) { // we should have encountered a wrong version method branch
-                        return;
-                    }
-                }
-                assert(dvmIsAbstractMethod(absMethod));
-            
-                std::vector<ClassObject*>* implclasses = findImplementClass(absMethod->clazz);
-                // use this vector to store the method which have been parsed since it seems that the method which is not overriden by its subclass will have the same reference
-                std::set<Method*> parsedMethod;
-                
-                for(unsigned int idx = 0; idx < implclasses->size(); idx++) {
-                    Method* methodToCall;
-                    int ifIdx;
-                    for (ifIdx = 0; ifIdx < implclasses->at(idx)->iftableCount; ifIdx++) {
-                        if (implclasses->at(idx)->iftable[ifIdx].clazz == absMethod->clazz) {
-                            break;
-                        }
-                    }
-                    int vtableIndex = implclasses->at(idx)->iftable[ifIdx].methodIndexArray[absMethod->methodIndex];
-                    methodToCall = implclasses->at(idx)->vtable[vtableIndex];
-                    assert(methodToCall != NULL);
-                    if(parsedMethod.find(methodToCall) != parsedMethod.end()) {
-                        continue;
-                    } else {
-                        parsedMethod.insert(methodToCall);
-                    }
-                    scanStatic(methodToCall, methodAccInfo, clazzAccMap, chain);
-                }
-            } else if(opcode == OP_INVOKE_SUPER || opcode == OP_INVOKE_DIRECT || opcode == OP_INVOKE_STATIC 
-                || opcode == OP_INVOKE_SUPER_RANGE || opcode == OP_INVOKE_DIRECT_RANGE || opcode == OP_INVOKE_STATIC_RANGE) {
-                ref = insns[1];             // method ref 
-            
-                Method* methodToCall;
-                if(opcode == OP_INVOKE_SUPER || opcode == OP_INVOKE_SUPER_RANGE) {
-                    Method* baseMethod;
-                    baseMethod = dvmDexGetResolvedMethod(methodClassDex, ref);
-                    if (baseMethod == NULL) {
-                        baseMethod = resolveMethod(method->clazz, ref, METHOD_VIRTUAL);
-                        if(baseMethod == NULL) { // we should have encountered a wrong version method branch
-                            return;
-                        }
-                    }
-                    assert(baseMethod->methodIndex < method->clazz->super->vtableCount);
-                    methodToCall = method->clazz->super->vtable[baseMethod->methodIndex];
-                } else if(opcode == OP_INVOKE_DIRECT || opcode == OP_INVOKE_DIRECT_RANGE) {
-                    methodToCall = dvmDexGetResolvedMethod(methodClassDex, ref);
-                    if (methodToCall == NULL) {
-                        methodToCall = resolveMethod(method->clazz, ref, METHOD_DIRECT);
-                    }
-                } else {
-                    methodToCall = dvmDexGetResolvedMethod(methodClassDex, ref);
-                    if (methodToCall == NULL) {
-                        methodToCall = resolveMethod(method->clazz, ref, METHOD_STATIC);
-                    }
-                } 
-                if(methodToCall == NULL) { // we should have encountered a wrong version method branch
-                    return;
-                }
-                scanStatic(methodToCall, methodAccInfo, clazzAccMap, chain);
-            }
-        }
-        methodStaticMap[method] = clazzAccMap;
-    }
-    //ALOGE("scan end, the size is: %d", clazzAccMap->size());
-    chain->erase(method);
-    if(caller != NULL) {
-        for (std::map<ClassObject*, BitsVec*>::iterator it = clazzAccMap->begin(); it != clazzAccMap->end(); ++it) {
-            if(caller->find(it->first) == caller->end()) {
-                (*caller)[it->first] = new BitsVec();
-            }
-            BitsVec* clazzAccInfo = (*caller)[it->first];
-            BitsVec* subAccInfo = it->second;
-            u4 sz = (subAccInfo->size >> 5) + 1;
-            if(clazzAccInfo->size < subAccInfo->size || (clazzAccInfo->size == subAccInfo->size && subAccInfo->size == 0)) {
-                u4* newbits = (u4*)calloc(sz, 4);
-                if(clazzAccInfo->bits != NULL) {
-                    memcpy(newbits, clazzAccInfo->bits, ((clazzAccInfo->size >> 5) + 1) << 2);
-                    free(clazzAccInfo->bits);
-                }
-                clazzAccInfo->bits = newbits;
-                clazzAccInfo->size = subAccInfo->size;
-            }
-            for(u4 i = 0; i < sz; i++) {
-                clazzAccInfo->bits[i] = clazzAccInfo->bits[i] | subAccInfo->bits[i];
-            }
-        }
-    } else {
-        for (std::map<ClassObject*, BitsVec*>::iterator it = clazzAccMap->begin(); it != clazzAccMap->end(); ++it) {
-            unsigned int i;
-            for(i = 0; i < methodAccInfo->globalClazz->size(); i++) {
-                if(it->first == methodAccInfo->globalClazz->at(i)->clazz) {
-                    break;
+static void replaceNewWithDest(ObjectAccInfo* newObjAccInfo, std::map<ObjectAccInfo*, ObjectAccInfo*>* addrMap) {
+    std::queue<ObjectAccInfo*> frontier;
+    frontier.push(newObjAccInfo);
+    std::set<ObjectAccInfo*> addedToQue;
+    addedToQue.insert(newObjAccInfo);
+    while(!frontier.empty()) {
+        ObjectAccInfo* objAccInfo = frontier.front();
+        frontier.pop();
+        for(unsigned int i = 0; i < objAccInfo->fieldSet.size(); i++) {
+            if(objAccInfo->fieldSet[i] != NULL) {
+                if((*addrMap)[objAccInfo->fieldSet[i]] != NULL) {
+                    objAccInfo->fieldSet[i] = (*addrMap)[objAccInfo->fieldSet[i]];
+                } else if(addedToQue.find(objAccInfo->fieldSet[i]) == addedToQue.end()) {
+                    frontier.push(objAccInfo->fieldSet[i]);
+                    addedToQue.insert(objAccInfo);
                 }
             }
-            if(i == methodAccInfo->globalClazz->size()) { // The first time to deal this global class object
-                ClazzAccInfo* clazzAccInfo = new ClazzAccInfo();
-                clazzAccInfo->clazz = it->first;
-                methodAccInfo->globalClazz->push_back(clazzAccInfo);
-            }
-            ClazzAccInfo* clazzAccInfo = methodAccInfo->globalClazz->at(i);
-            BitsVec* subAccInfo = it->second;
-            if(clazzAccInfo->fieldSet.size() < subAccInfo->size + 1) {
-                clazzAccInfo->fieldSet.resize(subAccInfo->size + 1);
-                clazzAccInfo->trackSet.resize(subAccInfo->size + 1);
-            }
-            for(i = 0; i < subAccInfo->size + 1; i++) {
-                if((subAccInfo->bits[i >> 5] & (1U << (i & 0x1F))) == 0) {
-                    continue;
-                } 
-                if(clazzAccInfo->fieldSet[i] == NULL) {
-                    ObjectAccInfo* fieldInfo = new ObjectAccInfo();
-                    fieldInfo->allFlag = true;
-                    clazzAccInfo->fieldSet[i] = fieldInfo;
-                    if(clazzAccInfo->trackSet[i] == NULL) {
-                        clazzAccInfo->trackSet[i] = new std::vector<ObjectAccInfo*>();
-                        clazzAccInfo->trackSet[i]->push_back(clazzAccInfo->fieldSet[i]);
+            if(objAccInfo->trackSet[i] != NULL) {
+                std::set<ObjectAccInfo*> changeset;
+                for(std::set<ObjectAccInfo*>::iterator it = objAccInfo->trackSet[i]->begin(); it != objAccInfo->trackSet[i]->end(); ++it) {
+                    if((*addrMap)[*it] != NULL) {
+                        changeset.insert(*it);
+                    } else if(addedToQue.find(*it) == addedToQue.end()) {
+                        frontier.push(*it);
+                        addedToQue.insert(*it);
                     }
-                } else {
-                    clazzAccInfo->fieldSet[i]->allFlag = true;
+                }
+                for(std::set<ObjectAccInfo*>::iterator it = changeset.begin(); it != changeset.end(); ++it) {
+                    objAccInfo->trackSet[i]->erase(*it);
+                    objAccInfo->trackSet[i]->insert((*addrMap)[*it]);
                 }
             }
         }
     }
-    //delete clazzAccMap;
 }
 
-void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>* chain, std::vector<int>* insOffsets, std::map<u2, std::vector<ObjectAccInfo*> >* interestRegObjMap, int depth, bool* exitMethod) {
+int mergecount = 0;
+static ParseInfo* findLeastOffParse(std::set<ParseInfo*>* executions) {
+    // union execution parse info with the same instruction offset
+    std::map<int, ParseInfo*> offParseMap;
+    bool ischanged = false;
+    for(std::set<ParseInfo*>::iterator it = executions->begin(); it != executions->end(); ++it) {
+        if(offParseMap.find((*it)->insoff) == offParseMap.end()) {
+            offParseMap[(*it)->insoff] = *it;
+        } else {
+            mergecount++;
+            ischanged = true;
+            ParseInfo* dst = offParseMap[(*it)->insoff];
+            dst->affectTry = true;
+            ParseInfo* src = *it;
+            std::map<ObjectAccInfo*, ObjectAccInfo*> addrMap;
+            unionMethodAccInfo(dst->methodAccInfo, src->methodAccInfo, &addrMap, true);
+            for(std::map<u2, std::set<ObjectAccInfo*> >::iterator mapit = src->interestRegObjMap->begin(); mapit != src->interestRegObjMap->end(); ++mapit) {
+                for(std::set<ObjectAccInfo*>::iterator setit = mapit->second.begin(); setit != mapit->second.end(); ++setit) {
+                    if(addrMap[*setit] == NULL) {
+                        replaceNewWithDest(*setit, &addrMap);
+                        (*(dst->interestRegObjMap))[mapit->first].insert(*setit);
+                    } else {
+                        (*(dst->interestRegObjMap))[mapit->first].insert(addrMap[*setit]);
+                    }
+                }
+            }
+            dst->insOffsets->insert(src->insOffsets->begin(), src->insOffsets->end());
+            freeParseInfo(src);
+        }
+    }
+    if(ischanged) {
+        executions->clear();
+        for(std::map<int, ParseInfo*>::iterator it = offParseMap.begin(); it != offParseMap.end(); ++it) {
+            executions->insert(it->second);
+        }
+    }
+
+    int minOff = INT_MAX;
+    ParseInfo* result = NULL;
+    for(std::set<ParseInfo*>::iterator it = executions->begin(); it != executions->end(); ++it) {
+        if((*it)->insoff < minOff) {
+            minOff = (*it)->insoff;
+            result = *it;
+        }
+    }
+    return result;
+}
+
+static void endParse(MethodAccInfo* methodAccInfo, ParseInfo* toParse, std::set<ParseInfo*>* executions) {
+    unionMethodAccInfo(methodAccInfo, toParse->methodAccInfo, false);
+    executions->erase(toParse);
+    freeParseInfo(toParse);
+}
+
+void pchain(std::vector<Method*>* chain) {
+    for(unsigned int i = 0; i < chain->size(); i++) {
+        ALOGE("%s.%s", chain->at(i)->clazz->descriptor, chain->at(i)->name);
+    }
+}
+
+void parseInsns(const u2* methInsns, MethodAccInfo* methodAccInfo, std::vector<Method*>* chain, int depth, bool* exitMethod) {
     if(*exitMethod) {
         return;
     }
+    int branches = 0;
+    unsigned int exeSize = 0;
     Method* method = methodAccInfo->method;
     DvmDex* methodClassDex = method->clazz->pDvmDex;
     u2 vsrc1, vdst;
     u4 ref;
-    Opcode opcode, lastOpcode = OP_UNUSED_79;
+    Opcode opcode = (Opcode) 0;
     int width, currentOffset;
-    for( ; ; lastOpcode = opcode, insns += width) {
-        width = dexGetWidthFromInstruction(insns);
-        opcode = dexOpcodeFromCodeUnit(*insns);
-        currentOffset = insns - method->insns;
-        insOffsets->push_back(currentOffset);
-        // each instruction might raise an exception, go to the corresponding handler to process
-        handleCatchBranch(insns, methodAccInfo, chain, insOffsets, interestRegObjMap, depth, exitMethod);
-        if(*exitMethod) {
-            return;
+    std::set<ParseInfo*> executions;
+    ParseInfo* parseInfo = new ParseInfo();
+    parseInfo->insoff = 0;
+    parseInfo->insOffsets = new std::set<int>();
+    MethodAccInfo* methdAcc = new MethodAccInfo();
+    methdAcc->method = method;
+    populateMethodAccInfo(methdAcc);
+    parseInfo->methodAccInfo = methdAcc;
+    parseInfo->interestRegObjMap = new std::map<u2, std::set<ObjectAccInfo*> >();
+    // sets the count to be the number of arguments and initiate them, and initialize interest registers
+    DexParameterIterator iterator;
+    const char* descriptor;
+    dexParameterIteratorInit(&iterator, &method->prototype);
+    for(int i = 0; i < method->insSize; i++) {
+        if(i == 0 && !dvmIsStaticMethod(method)) {
+            (*(parseInfo->interestRegObjMap))[method->registersSize - method->insSize + i].insert(parseInfo->methodAccInfo->args->at(i));
         }
+        if(i > 0 || dvmIsStaticMethod(method)) {
+            descriptor = dexParameterIteratorNextDescriptor(&iterator);
+            if(descriptor == NULL) {
+                //ALOGE("methodParser find NULL descriptor, insSize: %d, i: %d, method: %s.%s", method->insSize, i, method->clazz->descriptor, method->name);
+                break;
+            }
+            // we only cares object parameter
+            if(*descriptor == 'L' || *descriptor == '[') {
+                (*(parseInfo->interestRegObjMap))[method->registersSize - method->insSize + i].insert(parseInfo->methodAccInfo->args->at(i));
+            }
+        }
+    }
+    executions.insert(parseInfo);
+    while(!executions.empty()) {
+        if(executions.size() != exeSize) {
+            //ALOGE("the size of executions is: %d", exeSize);
+            exeSize = executions.size();
+        }
+        ParseInfo* toParse = findLeastOffParse(&executions);
+        const u2* insns = methInsns + toParse->insoff;
+        width = dexGetWidthFromInstruction(insns);
+        toParse->insOffsets->insert(toParse->insoff);
+        currentOffset = toParse->insoff;
+        opcode = dexOpcodeFromCodeUnit(*insns);
+        std::map<u2, std::set<ObjectAccInfo*> >* interestRegObjMap = toParse->interestRegObjMap;
+        if(toParse->affectTry) {
+            // each instruction might raise an exception, go to the corresponding handler to process
+            handleCatchBranch(method, toParse, &executions);
+        }
+        toParse->affectTry = false;
         if(opcode == OP_IGET || opcode == OP_IGET_WIDE || opcode == OP_IGET_OBJECT || opcode == OP_IGET_BOOLEAN 
             || opcode == OP_IGET_BYTE || opcode == OP_IGET_CHAR || opcode == OP_IGET_SHORT 
             || opcode == OP_IGET_VOLATILE || opcode == OP_IGET_OBJECT_VOLATILE || opcode == OP_IGET_WIDE_VOLATILE) {
@@ -1223,7 +1332,7 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
             if(interestRegObjMap->find(vsrc1) == interestRegObjMap->end()) {
                 // erase to initiate
                 interestRegObjMap->erase(vdst);
-                continue;
+                goto finally;
             }
             ref = insns[1];
             unsigned int offset;
@@ -1231,41 +1340,47 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
             if (ifield == NULL) {
                 ifield = resolveInstField(method->clazz, ref);
                 if(ifield == NULL) { // we should have encountered a wrong version field branch
-                    return;
+                    endParse(methodAccInfo, toParse, &executions);
+                    continue;
                 }
             }
             offset = (ifield->byteOffset - sizeof(Object)) >> 2;
             
             // set the field of the object as accessed
-            std::vector<ObjectAccInfo*> accVector = (*interestRegObjMap)[vsrc1];
+            std::set<ObjectAccInfo*> accVector = (*interestRegObjMap)[vsrc1];
             interestRegObjMap->erase(vdst);
-            for(unsigned int i = 0; i < accVector.size(); i++) {
-                ObjectAccInfo* objAccInfo = accVector.at(i);
+            for(std::set<ObjectAccInfo*>::iterator it = accVector.begin(); it != accVector.end(); ++it) {
+                ObjectAccInfo* objAccInfo = *it;
                 assert(objAccInfo != NULL);
                 // the current size are not big enough, it means that the field is not set by other instruction and its access is to the field of the object
                 if(objAccInfo->trackSet.size() < offset + 1) {
                     // resize the vector to accomodate the offset
+                    objAccInfo->nullBranchFlags.resize(offset + 1);
                     objAccInfo->fieldSet.resize(offset + 1);
                     objAccInfo->trackSet.resize(offset + 1);
                 }
                 // if the field has not been setup, then set the field
-                if(objAccInfo->trackSet[offset] == NULL) {
+                if(objAccInfo->trackSet[offset] == NULL || (objAccInfo->nullBranchFlags[offset] && objAccInfo->fieldSet[offset] == NULL)) {
                     ObjectAccInfo* fieldInfo = new ObjectAccInfo();
                     fieldInfo->belonging = objAccInfo;
                     if(objAccInfo->inArray) {
                         fieldInfo->inArray = true;
                     }
                     objAccInfo->fieldSet[offset] = fieldInfo;
-                    objAccInfo->trackSet[offset] = new std::vector<ObjectAccInfo*>();
-                    objAccInfo->trackSet[offset]->push_back(objAccInfo->fieldSet[offset]);
+                    if(objAccInfo->trackSet[offset] == NULL) {
+                        objAccInfo->trackSet[offset] = new std::set<ObjectAccInfo*>();
+                    }
+                    objAccInfo->trackSet[offset]->insert(objAccInfo->fieldSet[offset]);
                 }
-                // if the object is already set as migrate all, then ignore it
-                //if(isVecFlagedAll(objAccInfo->trackSet[offset])) {
-                //    continue;
-                //}
+                if(executions.size() == 1) {
+                    objAccInfo->nullBranchFlags[offset] = false;
+                }
                 if(opcode == OP_IGET_OBJECT || opcode == OP_IGET_OBJECT_VOLATILE) {
-                    pushVec(&((*interestRegObjMap)[vdst]), objAccInfo->trackSet[offset]);
+                    ((*interestRegObjMap)[vdst]).insert(objAccInfo->trackSet[offset]->begin(), objAccInfo->trackSet[offset]->end());
                 }
+            }
+            if(opcode == OP_IGET_OBJECT || opcode == OP_IGET_OBJECT_VOLATILE) {
+                toParse->affectTry = true;
             }
         } else if(opcode == OP_IPUT_OBJECT || opcode == OP_IPUT_OBJECT_VOLATILE) { // if the dst is in the interest, the src object's field should also be in interest
             vdst = inst_a(insns);
@@ -1276,53 +1391,63 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
             if (ifield == NULL) {
                 ifield = resolveInstField(method->clazz, ref);
                 if(ifield == NULL) { // we should have encountered a wrong version field branch
-                    return;
+                    endParse(methodAccInfo, toParse, &executions);
+                    continue;
                 }
             }
             offset = (ifield->byteOffset - sizeof(Object)) >> 2;
             
             // both src object and dst are not in our interest
             if(interestRegObjMap->find(vdst) == interestRegObjMap->end() && interestRegObjMap->find(vsrc1) == interestRegObjMap->end()) {
-                continue;
+                goto finally;
             } else if(interestRegObjMap->find(vdst) == interestRegObjMap->end() && interestRegObjMap->find(vsrc1) != interestRegObjMap->end()) { 
                 // only src object are in interest, in this case, we set the offset to be an arbitrary one to make sure it will not pollute the original data
-                std::vector<ObjectAccInfo*> srcVector = (*interestRegObjMap)[vsrc1];
-                for(unsigned int j = 0; j < srcVector.size(); j++) {
-                    ObjectAccInfo* interestAccInfo = srcVector.at(j);
+                std::set<ObjectAccInfo*> srcVector = (*interestRegObjMap)[vsrc1];
+                for(std::set<ObjectAccInfo*>::iterator it = srcVector.begin(); it != srcVector.end(); ++it) {
+                    ObjectAccInfo* interestAccInfo = *it;
                     if(interestAccInfo->trackSet.size() < offset + 1) {
+                        interestAccInfo->nullBranchFlags.resize(offset + 1);
                         interestAccInfo->fieldSet.resize(offset + 1);
                         interestAccInfo->trackSet.resize(offset + 1);
                     }
                     if(interestAccInfo->trackSet[offset] != NULL) {
                         delete interestAccInfo->trackSet[offset];
                     }
-                    interestAccInfo->trackSet[offset] = new std::vector<ObjectAccInfo*>();
+                    interestAccInfo->trackSet[offset] = new std::set<ObjectAccInfo*>();
+                    if(executions.size() == 1) {
+                        interestAccInfo->nullBranchFlags[offset] = false;
+                    }
                 }
-                continue;
+                goto finally;
             }
             // the dst register is in our interest
             if(interestRegObjMap->find(vsrc1) == interestRegObjMap->end()) {
-                (*interestRegObjMap)[vsrc1].push_back(new ObjectAccInfo());
+                (*interestRegObjMap)[vsrc1].insert(new ObjectAccInfo());
             }
                     
-            std::vector<ObjectAccInfo*> srcVector = (*interestRegObjMap)[vsrc1];
+            std::set<ObjectAccInfo*> srcVector = (*interestRegObjMap)[vsrc1];
             bool hasInArray = false;
-            for(unsigned i = 0; i < srcVector.size(); i++) {
-                ObjectAccInfo* interestAccInfo = srcVector.at(i);
+            for(std::set<ObjectAccInfo*>::iterator it = srcVector.begin(); it != srcVector.end(); ++it) {
+                ObjectAccInfo* interestAccInfo = *it;
                 if(!hasInArray && interestAccInfo->inArray) {
                     hasInArray = true;
                     flagVecAllArray(&((*interestRegObjMap)[vdst]));
                 }
                 if(interestAccInfo->trackSet.size() < offset + 1) {
+                    interestAccInfo->nullBranchFlags.resize(offset + 1);
                     interestAccInfo->fieldSet.resize(offset + 1);
                     interestAccInfo->trackSet.resize(offset + 1);
                 }
                 if(interestAccInfo->trackSet[offset] != NULL) {
                     delete interestAccInfo->trackSet[offset];
                 }
-                interestAccInfo->trackSet[offset] = new std::vector<ObjectAccInfo*>();
-                interestAccInfo->trackSet[offset]->insert(interestAccInfo->trackSet[offset]->begin(), (*interestRegObjMap)[vdst].begin(), (*interestRegObjMap)[vdst].end());
+                interestAccInfo->trackSet[offset] = new std::set<ObjectAccInfo*>();
+                interestAccInfo->trackSet[offset]->insert((*interestRegObjMap)[vdst].begin(), (*interestRegObjMap)[vdst].end());
+                if(executions.size() == 1) {
+                    interestAccInfo->nullBranchFlags[offset] = false;
+                }
             }
+            toParse->affectTry = true;
         } else if(opcode == OP_SGET_VOLATILE || opcode == OP_SGET_WIDE_VOLATILE || opcode == OP_SGET_OBJECT_VOLATILE
             || opcode == OP_SGET || opcode == OP_SGET_WIDE || opcode == OP_SGET_OBJECT || opcode == OP_SGET_BOOLEAN
             || opcode == OP_SGET_BYTE || opcode == OP_SGET_CHAR || opcode == OP_SGET_SHORT) {
@@ -1332,28 +1457,29 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
             if (sfield == NULL) {
                 sfield = resolveStaticField(method->clazz, ref);
                 if(sfield == NULL) { // we should have encountered a wrong version field branch
-                    return;
+                    endParse(methodAccInfo, toParse, &executions);
+                    continue;
                 }
             }
             unsigned int offset = sfield - sfield->clazz->sfields;
             unsigned int i;
-            for(i = 0; i < methodAccInfo->globalClazz->size(); i++) {
-                if(sfield->clazz == methodAccInfo->globalClazz->at(i)->clazz) {
+            for(i = 0; i < toParse->methodAccInfo->globalClazz->size(); i++) {
+                if(sfield->clazz == toParse->methodAccInfo->globalClazz->at(i)->clazz) {
                     break;
                 }
             }
-            if(i == methodAccInfo->globalClazz->size()) { // The first time to deal this global class object
+            if(i == toParse->methodAccInfo->globalClazz->size()) { // The first time to deal this global class object
                 ClazzAccInfo* clazzAccInfo = new ClazzAccInfo();
                 clazzAccInfo->clazz = sfield->clazz;
-                methodAccInfo->globalClazz->push_back(clazzAccInfo);
+                toParse->methodAccInfo->globalClazz->push_back(clazzAccInfo);
             }
-            ClazzAccInfo* clazzAccInfo = methodAccInfo->globalClazz->at(i);
+            ClazzAccInfo* clazzAccInfo = toParse->methodAccInfo->globalClazz->at(i);
             if(clazzAccInfo->trackSet.size() < offset + 1) { // the current size of trackSet vector are not big enough
+                clazzAccInfo->nullBranchFlags.resize(offset + 1);
                 clazzAccInfo->fieldSet.resize(offset + 1);
                 clazzAccInfo->trackSet.resize(offset + 1);
             }
             // if the field has not been setup, then set the field
-            assert(clazzAccInfo->trackSet[offset] == NULL || clazzAccInfo->trackSet[offset] != NULL);
             if(clazzAccInfo->trackSet[offset] == NULL) {
                 ObjectAccInfo* fieldInfo = new ObjectAccInfo();
                 fieldInfo->belonging = clazzAccInfo;
@@ -1361,8 +1487,11 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
                     fieldInfo->inArray = true;
                 }
                 clazzAccInfo->fieldSet[offset] = fieldInfo;
-                clazzAccInfo->trackSet[offset] = new std::vector<ObjectAccInfo*>();
-                clazzAccInfo->trackSet[offset]->push_back(clazzAccInfo->fieldSet[offset]);
+                clazzAccInfo->trackSet[offset] = new std::set<ObjectAccInfo*>();
+                clazzAccInfo->trackSet[offset]->insert(clazzAccInfo->fieldSet[offset]);
+            }
+            if(executions.size() == 1) {
+                clazzAccInfo->nullBranchFlags[offset] = false;
             }
             interestRegObjMap->erase(vdst);
             // if the object is already set as migrate all, then ignore it
@@ -1372,6 +1501,7 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
             // add the destination register into the interest map
             if(opcode == OP_SGET_OBJECT_VOLATILE || opcode == OP_SGET_OBJECT) {
                 (*interestRegObjMap)[vdst] = *(clazzAccInfo->trackSet[offset]);
+                toParse->affectTry = true;
             }
         } else if(opcode == OP_SPUT_OBJECT || opcode == OP_SPUT_OBJECT_VOLATILE) {// if the dst is in the interest, the src class'es field should also be in interest
             vdst = inst_aa(insns);
@@ -1380,23 +1510,25 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
             if (sfield == NULL) {
                 sfield = resolveStaticField(method->clazz, ref);
                 if(sfield == NULL) { // we should have encountered a wrong version field branch
-                    return;
+                    endParse(methodAccInfo, toParse, &executions);
+                    continue;
                 }
             }
             unsigned int offset = sfield - sfield->clazz->sfields;
             unsigned int i;
-            for(i = 0; i < methodAccInfo->globalClazz->size(); i++) {
-                if(sfield->clazz == methodAccInfo->globalClazz->at(i)->clazz) {
+            for(i = 0; i < toParse->methodAccInfo->globalClazz->size(); i++) {
+                if(sfield->clazz == toParse->methodAccInfo->globalClazz->at(i)->clazz) {
                     break;
                 }
             }
-            if(i == methodAccInfo->globalClazz->size()) { // The first time to deal this global class object
+            if(i == toParse->methodAccInfo->globalClazz->size()) { // The first time to deal this global class object
                 ClazzAccInfo* clazzAccInfo = new ClazzAccInfo();
                 clazzAccInfo->clazz = sfield->clazz;
-                methodAccInfo->globalClazz->push_back(clazzAccInfo);
+                toParse->methodAccInfo->globalClazz->push_back(clazzAccInfo);
             }
-            ClazzAccInfo* clazzAccInfo = methodAccInfo->globalClazz->at(i);
+            ClazzAccInfo* clazzAccInfo = toParse->methodAccInfo->globalClazz->at(i);
             if(clazzAccInfo->trackSet.size() < offset + 1) { // the current size of trackSet vector are not big enough
+                clazzAccInfo->nullBranchFlags.resize(offset + 1);
                 clazzAccInfo->fieldSet.resize(offset + 1);
                 clazzAccInfo->trackSet.resize(offset + 1);
             }
@@ -1405,8 +1537,8 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
                 if(clazzAccInfo->trackSet[offset] != NULL) {
                     delete clazzAccInfo->trackSet[offset];
                 }
-                clazzAccInfo->trackSet[offset] = new std::vector<ObjectAccInfo*>();
-                continue;
+                clazzAccInfo->trackSet[offset] = new std::set<ObjectAccInfo*>();
+                goto finally;
             }
             // the src clazz and dst register are both in our interest
             if(clazzAccInfo->trackSet[offset] != NULL) {
@@ -1415,8 +1547,12 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
             if(clazzAccInfo->inArray) {
                 flagVecAllArray(&((*interestRegObjMap)[vdst]));
             }
-            clazzAccInfo->trackSet[offset] = new std::vector<ObjectAccInfo*>();
-            clazzAccInfo->trackSet[offset]->insert(clazzAccInfo->trackSet[offset]->begin(), (*interestRegObjMap)[vdst].begin(), (*interestRegObjMap)[vdst].end());
+            clazzAccInfo->trackSet[offset] = new std::set<ObjectAccInfo*>();
+            clazzAccInfo->trackSet[offset]->insert((*interestRegObjMap)[vdst].begin(), (*interestRegObjMap)[vdst].end());
+            toParse->affectTry = true;
+            if(executions.size() == 1) {
+                clazzAccInfo->nullBranchFlags[offset] = false;
+            }
         } else if(opcode == OP_MOVE || opcode == OP_MOVE_FROM16 || opcode == OP_MOVE_16
             || opcode == OP_MOVE_WIDE || opcode == OP_MOVE_WIDE_FROM16 || opcode == OP_MOVE_WIDE_16
             || opcode == OP_MOVE_OBJECT || opcode == OP_MOVE_OBJECT_FROM16 || opcode == OP_MOVE_OBJECT_16) {
@@ -1437,14 +1573,17 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
             } else {
                 // add the destination register into the interest map
                 (*interestRegObjMap)[vdst] = (*interestRegObjMap)[vsrc1];
+                if(opcode == OP_MOVE_OBJECT || opcode == OP_MOVE_OBJECT_FROM16 || opcode == OP_MOVE_OBJECT_16) {
+                    toParse->affectTry = true;
+                }
             }
         } else if(opcode == OP_INVOKE_VIRTUAL || opcode == OP_INVOKE_VIRTUAL_RANGE) {
             vsrc1 = inst_aa(insns);      // AA (count) or BA (count + arg 5) 
             ref = insns[1];             // method ref 
             vdst = insns[2];            // 4 regs -or- first reg
-            if(methodAccInfo->curMethodReturns != NULL) {
-                delete methodAccInfo->curMethodReturns;
-                methodAccInfo->curMethodReturns = NULL;
+            if(toParse->methodAccInfo->curMethodReturns != NULL) {
+                delete toParse->methodAccInfo->curMethodReturns;
+                toParse->methodAccInfo->curMethodReturns = NULL;
             }
             
             int voffset;
@@ -1453,7 +1592,8 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
             if (baseMethod == NULL) {
                 baseMethod = resolveMethod(method->clazz, ref, METHOD_VIRTUAL);
                 if(baseMethod == NULL) { // we should have encountered a wrong version method branch
-                    return;
+                    endParse(methodAccInfo, toParse, &executions);
+                    continue;
                 }
             }
             voffset = baseMethod->methodIndex;
@@ -1466,22 +1606,7 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
                 hasInterest = rangeMethodHasInterest(vsrc1, vdst, interestRegObjMap);
             }
             if(!hasInterest) {
-                /*std::vector<ClassObject*>* subclasses = findSubClass(baseMethod->clazz);
-                // use this vector to store the method which have been parsed since it seems that the method which is not overriden by its subclass will have the same reference
-                std::set<Method*> parsedMethod;
-                
-                for(unsigned int idx = 0; idx < subclasses->size(); idx++) {
-                    Method* methodToCall = subclasses->at(idx)->vtable[voffset];
-                    assert(methodToCall != NULL);
-                    if(parsedMethod.find(methodToCall) != parsedMethod.end()) {
-                        continue;
-                    } else {
-                        parsedMethod.insert(methodToCall);
-                    }
-                    std::set<Method*> mchain;
-                    scanStatic(methodToCall, methodAccInfo, NULL, &mchain);
-                }*/
-                continue;
+                goto finally;
             }
             
             bool isLangObjectClass = baseMethod->clazz == javaLangObject;
@@ -1498,28 +1623,13 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
                 } else {
                     rangeMethodRegsFlagAll(vsrc1, vdst, interestRegObjMap);
                 }
-                /*std::vector<ClassObject*>* subclasses = findSubClass(baseMethod->clazz);
-                // use this vector to store the method which have been parsed since it seems that the method which is not overriden by its subclass will have the same reference
-                std::set<Method*> parsedMethod;
-                
-                for(unsigned int idx = 0; idx < subclasses->size(); idx++) {
-                    Method* methodToCall = subclasses->at(idx)->vtable[voffset];
-                    assert(methodToCall != NULL);
-                    if(parsedMethod.find(methodToCall) != parsedMethod.end()) {
-                        continue;
-                    } else {
-                        parsedMethod.insert(methodToCall);
-                    }
-                    std::set<Method*> mchain;
-                    scanStatic(methodToCall, methodAccInfo, NULL, &mchain);
-                }*/
-                continue;
+                goto finally;
             }
             //ALOGE("methodParser parse virtual %s.%s", baseMethod->clazz->descriptor, baseMethod->name);
             MethodAccInfo* subAccInfo;
-            if(virtualResMap.find(baseMethod) != virtualResMap.end()) {
-                subAccInfo = virtualResMap[baseMethod];
-            } else {
+            //if(virtualResMap.find(baseMethod) != virtualResMap.end()) {
+            //    subAccInfo = virtualResMap[baseMethod];
+            //} else {
                 subAccInfo = new MethodAccInfo();
                 subAccInfo->method = baseMethod;
                 populateMethodAccInfo(subAccInfo);
@@ -1531,7 +1641,7 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
                     } else {
                         rangeMethodRegsFlagAll(vsrc1, vdst, interestRegObjMap);
                     }
-                    continue;
+                    goto finally;
                 }
                 // use this vector to store the method which have been parsed since it seems that the method which is not overriden by its subclass will have the same reference
                 std::set<Method*> parsedMethod;
@@ -1544,29 +1654,29 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
                     } else {
                         parsedMethod.insert(methodToCall);
                     }
-                    MethodAccInfo* toCallAccInfo;
-                    if(methodResMap.find(methodToCall) == methodResMap.end()) {
-                        // setup subcall method access info and parse
-                        toCallAccInfo = parseMethod(methodToCall, chain);
-                    } else {
-                        toCallAccInfo = methodResMap[methodToCall];
-                    }
-                    unionMethodAccInfo(subAccInfo, toCallAccInfo);
+                    MethodAccInfo* toCallAccInfo = new MethodAccInfo();
+                    toCallAccInfo->method = methodToCall;
+                    // setup subcall method access info and parse
+                    parseMethod(toCallAccInfo, chain);
+                    unionMethodAccInfo(subAccInfo, toCallAccInfo, false);
+                    freeMethodAccInfo(toCallAccInfo);
                 }
-                virtualResMap[baseMethod] = subAccInfo;
-            }
+            //    virtualResMap[baseMethod] = subAccInfo;
+            //}
             if(opcode == OP_INVOKE_VIRTUAL) {
-                mergeMethodArgs(vsrc1, vdst, interestRegObjMap, methodAccInfo, subAccInfo);
+                mergeMethodArgs(vsrc1, vdst, interestRegObjMap, toParse->methodAccInfo, subAccInfo);
             } else {
-                mergeRangeMethodArgs(vsrc1, vdst, interestRegObjMap, methodAccInfo, subAccInfo);
+                mergeRangeMethodArgs(vsrc1, vdst, interestRegObjMap, toParse->methodAccInfo, subAccInfo);
             }
+            freeMethodAccInfo(subAccInfo);
+            toParse->affectTry = true;
         } else if(opcode == OP_INVOKE_INTERFACE || opcode == OP_INVOKE_INTERFACE_RANGE) { // see Interp.cpp-dvmInterpFindInterfaceMethod
             vsrc1 = inst_aa(insns);      // AA (count) or BA (count + arg 5) 
             ref = insns[1];             // method ref 
             vdst = insns[2];            // 4 regs -or- first reg
-            if(methodAccInfo->curMethodReturns != NULL) {
-                delete methodAccInfo->curMethodReturns;
-                methodAccInfo->curMethodReturns = NULL;
+            if(toParse->methodAccInfo->curMethodReturns != NULL) {
+                delete toParse->methodAccInfo->curMethodReturns;
+                toParse->methodAccInfo->curMethodReturns = NULL;
             }
             
             Method* absMethod;
@@ -1574,7 +1684,8 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
             if (absMethod == NULL) {
                 absMethod = resolveInterfaceMethod(method->clazz, ref);
                  if(absMethod == NULL) { // we should have encountered a wrong version method branch
-                    return;
+                     endParse(methodAccInfo, toParse, &executions);
+                     continue;
                 }
             }
             assert(dvmIsAbstractMethod(absMethod));
@@ -1587,30 +1698,7 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
                 hasInterest = rangeMethodHasInterest(vsrc1, vdst, interestRegObjMap);
             }
             if(!hasInterest) {
-                /*std::vector<ClassObject*>* implclasses = findImplementClass(absMethod->clazz);
-                // use this vector to store the method which have been parsed since it seems that the method which is not overriden by its subclass will have the same reference
-                std::set<Method*> parsedMethod;
-                
-                for(unsigned int idx = 0; idx < implclasses->size(); idx++) {
-                    Method* methodToCall;
-                    int ifIdx;
-                    for (ifIdx = 0; ifIdx < implclasses->at(idx)->iftableCount; ifIdx++) {
-                        if (implclasses->at(idx)->iftable[ifIdx].clazz == absMethod->clazz) {
-                            break;
-                        }
-                    }
-                    int vtableIndex = implclasses->at(idx)->iftable[ifIdx].methodIndexArray[absMethod->methodIndex];
-                    methodToCall = implclasses->at(idx)->vtable[vtableIndex];
-                    assert(methodToCall != NULL);
-                    if(parsedMethod.find(methodToCall) != parsedMethod.end()) {
-                        continue;
-                    } else {
-                        parsedMethod.insert(methodToCall);
-                    }
-                    std::set<Method*> mchain;
-                    scanStatic(methodToCall, methodAccInfo, NULL, &mchain);
-                }*/
-                continue;
+                goto finally;
             }
             
             bool isExempt = false;
@@ -1626,37 +1714,14 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
                 } else {
                     rangeMethodRegsFlagAll(vsrc1, vdst, interestRegObjMap);
                 }
-                /*std::vector<ClassObject*>* implclasses = findImplementClass(absMethod->clazz);
-                // use this vector to store the method which have been parsed since it seems that the method which is not overriden by its subclass will have the same reference
-                std::set<Method*> parsedMethod;
-                
-                for(unsigned int idx = 0; idx < implclasses->size(); idx++) {
-                    Method* methodToCall;
-                    int ifIdx;
-                    for (ifIdx = 0; ifIdx < implclasses->at(idx)->iftableCount; ifIdx++) {
-                        if (implclasses->at(idx)->iftable[ifIdx].clazz == absMethod->clazz) {
-                            break;
-                        }
-                    }
-                    int vtableIndex = implclasses->at(idx)->iftable[ifIdx].methodIndexArray[absMethod->methodIndex];
-                    methodToCall = implclasses->at(idx)->vtable[vtableIndex];
-                    assert(methodToCall != NULL);
-                    if(parsedMethod.find(methodToCall) != parsedMethod.end()) {
-                        continue;
-                    } else {
-                        parsedMethod.insert(methodToCall);
-                    }
-                    std::set<Method*> mchain;
-                    scanStatic(methodToCall, methodAccInfo, NULL, &mchain);
-                }*/
-                continue;
+                goto finally;
             }
             
             //ALOGE("methodParser parse virtual %s.%s", baseMethod->clazz->descriptor, baseMethod->name);
             MethodAccInfo* subAccInfo;
-            if(interResMap.find(absMethod) != interResMap.end()) {
-                subAccInfo = interResMap[absMethod];
-            } else {
+            //if(interResMap.find(absMethod) != interResMap.end()) {
+            //    subAccInfo = interResMap[absMethod];
+            //} else {
                 subAccInfo = new MethodAccInfo();
                 subAccInfo->method = absMethod;
                 populateMethodAccInfo(subAccInfo);
@@ -1668,7 +1733,7 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
                     } else {
                         rangeMethodRegsFlagAll(vsrc1, vdst, interestRegObjMap);
                     }
-                    continue;
+                    goto finally;
                 }
                 // use this vector to store the method which have been parsed since it seems that the method which is not overriden by its subclass will have the same reference
                 std::set<Method*> parsedMethod;
@@ -1689,30 +1754,30 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
                     } else {
                         parsedMethod.insert(methodToCall);
                     }
-                    MethodAccInfo* toCallAccInfo;
-                    if(methodResMap.find(methodToCall) == methodResMap.end()) {
-                        // setup subcall method access info and parse
-                        toCallAccInfo = parseMethod(methodToCall, chain);
-                    } else {
-                        toCallAccInfo = methodResMap[methodToCall];
-                    }
-                    unionMethodAccInfo(subAccInfo, toCallAccInfo);
+                    MethodAccInfo* toCallAccInfo = new MethodAccInfo();
+                    toCallAccInfo->method = methodToCall;
+                    // setup subcall method access info and parse
+                    parseMethod(toCallAccInfo, chain);
+                    unionMethodAccInfo(subAccInfo, toCallAccInfo, false);
+                    freeMethodAccInfo(toCallAccInfo);
                 }
-                interResMap[absMethod] = subAccInfo;
-            }
+                //interResMap[absMethod] = subAccInfo;
+            //}
             if(opcode == OP_INVOKE_INTERFACE) {
-                mergeMethodArgs(vsrc1, vdst, interestRegObjMap, methodAccInfo, subAccInfo);
+                mergeMethodArgs(vsrc1, vdst, interestRegObjMap, toParse->methodAccInfo, subAccInfo);
             } else {
-                mergeRangeMethodArgs(vsrc1, vdst, interestRegObjMap, methodAccInfo, subAccInfo);
+                mergeRangeMethodArgs(vsrc1, vdst, interestRegObjMap, toParse->methodAccInfo, subAccInfo);
             }
+            freeMethodAccInfo(subAccInfo);
+            toParse->affectTry = true;
         } else if(opcode == OP_INVOKE_SUPER || opcode == OP_INVOKE_DIRECT || opcode == OP_INVOKE_STATIC 
             || opcode == OP_INVOKE_SUPER_RANGE || opcode == OP_INVOKE_DIRECT_RANGE || opcode == OP_INVOKE_STATIC_RANGE) {
             vsrc1 = inst_aa(insns);      // AA (count) or BA (count + arg 5) 
             ref = insns[1];             // method ref 
             vdst = insns[2];            // 4 regs -or- first reg
-            if(methodAccInfo->curMethodReturns != NULL) {
-                delete methodAccInfo->curMethodReturns; 
-                methodAccInfo->curMethodReturns = NULL;
+            if(toParse->methodAccInfo->curMethodReturns != NULL) {
+                delete toParse->methodAccInfo->curMethodReturns;
+                toParse->methodAccInfo->curMethodReturns = NULL;
             }
             
             // check if the method invocation involves interesting registers
@@ -1723,7 +1788,7 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
                 hasInterest = rangeMethodHasInterest(vsrc1, vdst, interestRegObjMap);
             }
             if(!hasInterest) {
-                continue;
+                goto finally;
             }
             
             Method* methodToCall;
@@ -1733,7 +1798,8 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
                 if (baseMethod == NULL) {
                     baseMethod = resolveMethod(method->clazz, ref, METHOD_VIRTUAL);
                     if(baseMethod == NULL) { // we should have encountered a wrong version method branch
-                        return;
+                        endParse(methodAccInfo, toParse, &executions);
+                        continue;
                     }
                 }
                 assert(baseMethod->methodIndex < method->clazz->super->vtableCount);
@@ -1750,86 +1816,77 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
                 }
             } 
             if(methodToCall == NULL) { // we should have encountered a wrong version method branch
-                return;
+                endParse(methodAccInfo, toParse, &executions);
+                continue;
             }
             //ALOGE("methodParser parse virtual %s.%s", baseMethod->clazz->descriptor, baseMethod->name);
-            MethodAccInfo* subAccInfo;
-            if(methodResMap.find(methodToCall) == methodResMap.end()) {
-                // setup subcall method access info and parse
-                subAccInfo = parseMethod(methodToCall, chain);
-            } else {
-                subAccInfo = methodResMap[methodToCall];
-            }
+            MethodAccInfo* subAccInfo = new MethodAccInfo();
+            subAccInfo->method = methodToCall;
+            // setup subcall method access info and parse
+            parseMethod(subAccInfo, chain);
             if(opcode == OP_INVOKE_SUPER || opcode == OP_INVOKE_DIRECT || opcode == OP_INVOKE_STATIC) {
-                mergeMethodArgs(vsrc1, vdst, interestRegObjMap, methodAccInfo, subAccInfo);
+                mergeMethodArgs(vsrc1, vdst, interestRegObjMap, toParse->methodAccInfo, subAccInfo);
             } else {
-                mergeRangeMethodArgs(vsrc1, vdst, interestRegObjMap, methodAccInfo, subAccInfo);
+                mergeRangeMethodArgs(vsrc1, vdst, interestRegObjMap, toParse->methodAccInfo, subAccInfo);
             }
+            freeMethodAccInfo(subAccInfo);
+            toParse->affectTry = true;
         } else if(opcode == OP_MOVE_RESULT || opcode == OP_MOVE_RESULT_WIDE || opcode == OP_MOVE_EXCEPTION) {
             vdst = inst_aa(insns);
             interestRegObjMap->erase(vdst);
-            if(methodAccInfo->curMethodReturns != NULL) {
-                delete methodAccInfo->curMethodReturns;
-                methodAccInfo->curMethodReturns = NULL;
+            if(toParse->methodAccInfo->curMethodReturns != NULL) {
+                delete toParse->methodAccInfo->curMethodReturns;
+                toParse->methodAccInfo->curMethodReturns = NULL;
             }
         } else if(opcode == OP_MOVE_RESULT_OBJECT) {
             vdst = inst_aa(insns);
             // we only process the move result of a method
-            if(lastOpcode == OP_FILLED_NEW_ARRAY || lastOpcode == OP_FILLED_NEW_ARRAY_RANGE) {
+            if(toParse->lastop == OP_FILLED_NEW_ARRAY || toParse->lastop == OP_FILLED_NEW_ARRAY_RANGE) {
                 // in this case, we erase the destination register from the interest interest because we have flagged the object it include as all
                 interestRegObjMap->erase(vdst);
-                continue;
+                goto finally;
             }
-            if(methodAccInfo->curMethodReturns != NULL) {
-                (*interestRegObjMap)[vdst] = *(methodAccInfo->curMethodReturns);
-                delete methodAccInfo->curMethodReturns;
-                methodAccInfo->curMethodReturns = NULL;
+            if(toParse->methodAccInfo->curMethodReturns != NULL) {
+                (*interestRegObjMap)[vdst] = *(toParse->methodAccInfo->curMethodReturns);
+                delete toParse->methodAccInfo->curMethodReturns;
+                toParse->methodAccInfo->curMethodReturns = NULL;
+                toParse->affectTry = true;
             } else {
                 interestRegObjMap->erase(vdst);
             }
         } else if(opcode == OP_RETURN_VOID || opcode == OP_RETURN || opcode == OP_RETURN_WIDE) {
             // stop the current branch of parsing instruction stream
-            return;
+            endParse(methodAccInfo, toParse, &executions);
+            continue;
         } else if(opcode == OP_RETURN_OBJECT) {
             vsrc1 = inst_aa(insns);
             if(interestRegObjMap->find(vsrc1) != interestRegObjMap->end()) {
-                if(methodAccInfo->returnObjs == NULL) {
-                    methodAccInfo->returnObjs = new std::vector<ObjectAccInfo*>();
+                if(toParse->methodAccInfo->returnObjs == NULL) {
+                    toParse->methodAccInfo->returnObjs = new std::set<ObjectAccInfo*>();
                 }
-                pushVec(methodAccInfo->returnObjs, &((*interestRegObjMap)[vsrc1]));
+                toParse->methodAccInfo->returnObjs->insert(((*interestRegObjMap)[vsrc1]).begin(), ((*interestRegObjMap)[vsrc1]).end());
             }
             // stop the current branch of parsing instruction stream
-            return;
+            endParse(methodAccInfo, toParse, &executions);
+            continue;
         } else if(opcode == OP_IF_EQ || opcode == OP_IF_NE || opcode == OP_IF_LT
             || opcode == OP_IF_GE || opcode == OP_IF_GT || opcode == OP_IF_LE
             || opcode == OP_IF_EQZ || opcode == OP_IF_NEZ || opcode == OP_IF_LTZ
             || opcode == OP_IF_GEZ || opcode == OP_IF_GTZ || opcode == OP_IF_LEZ) {
+            branches++;
             int branchOffset = (s2)insns[1];
             // check if the branch will lead to an instruction cycle
             bool isCycle = false;
             int newOffset = currentOffset + branchOffset;
-            for(unsigned int i = 0; i < insOffsets->size(); i++) {
-                if(newOffset == insOffsets->at(i)) {
-                    isCycle = true;
-                    break;
-                }
+            if(toParse->insOffsets->find(newOffset) != toParse->insOffsets->end()) {
+                isCycle = true;
             }
             if(!isCycle) {
-                // parse the branch taken
-                const u2* temp = insns;
-                temp += branchOffset;
-                std::vector<int> tempInsOffsets = *insOffsets;
-                std::map<u2, std::vector<ObjectAccInfo*> > tempInterest = *interestRegObjMap;
-                int newDepth = depth + 1;
-                // If we reach the maximum branch depth, we exit the parse of the method to save the cost of parse
-                if(newDepth >= MaxBranchDepth) {
-                    for(unsigned int i = 0; i < methodAccInfo->args->size(); i++) {
-                        flagObjAll(methodAccInfo->args->at(i));
-                    }
-                    *exitMethod = true;
-                    return;
-                }
-                parseInsns(temp, methodAccInfo, chain, &tempInsOffsets, &tempInterest, newDepth, exitMethod);
+                toParse->lastop = opcode;
+                ParseInfo* branchParseInfo = new ParseInfo();
+                copyParseInfo(toParse, branchParseInfo);
+                branchParseInfo->insoff = newOffset;
+                executions.insert(branchParseInfo);
             }
             
             // the continuation of the loop will parse the branch not taken
@@ -1839,14 +1896,12 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
             // check if the goto will lead to an instruction cycle
             bool isCycle = false;
             int newOffset = currentOffset + width;
-            for(unsigned int i = 0; i < insOffsets->size(); i++) {
-                if(newOffset == insOffsets->at(i)) {
-                    isCycle = true;
-                    break;
-                }
+            if(toParse->insOffsets->find(newOffset) != toParse->insOffsets->end()) {
+                isCycle = true;
             }
             if(isCycle) {
-                return;
+                endParse(methodAccInfo, toParse, &executions);
+                continue;
             }
         } else if(opcode == OP_GOTO_16) {
             s4 offset = (s2) insns[1];
@@ -1854,14 +1909,12 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
             // check if the goto will lead to an instruction cycle
             bool isCycle = false;
             int newOffset = currentOffset + width;
-            for(unsigned int i = 0; i < insOffsets->size(); i++) {
-                if(newOffset == insOffsets->at(i)) {
-                    isCycle = true;
-                    break;
-                }
+            if(toParse->insOffsets->find(newOffset) != toParse->insOffsets->end()) {
+                isCycle = true;
             }
             if(isCycle) {
-                return;
+                endParse(methodAccInfo, toParse, &executions);
+                continue;
             }
         } else if(opcode == OP_GOTO_32) {
             s4 offset = insns[1];               // low-order 16 bits
@@ -1870,14 +1923,12 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
             // check if the goto will lead to an instruction cycle
             bool isCycle = false;
             int newOffset = currentOffset + width;
-            for(unsigned int i = 0; i < insOffsets->size(); i++) {
-                if(newOffset == insOffsets->at(i)) {
-                    isCycle = true;
-                    break;
-                }
+            if(toParse->insOffsets->find(newOffset) != toParse->insOffsets->end()) {
+                isCycle = true;
             }
             if(isCycle) {
-                return;
+                endParse(methodAccInfo, toParse, &executions);
+                continue;
             }
         } else if(opcode == OP_PACKED_SWITCH || opcode == OP_SPARSE_SWITCH) {
             s4 offset;
@@ -1915,28 +1966,16 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
                 // check if the switch case will lead to an instruction cycle
                 bool isCycle = false;
                 int newOffset = currentOffset + offset;
-                for(unsigned int i = 0; i < insOffsets->size(); i++) {
-                    if(newOffset == insOffsets->at(i)) {
-                        isCycle = true;
-                        break;
-                    }
+                if(toParse->insOffsets->find(newOffset) != toParse->insOffsets->end()) {
+                    isCycle = true;
                 }
                 if(!isCycle) {
                     // parse the branch taken
-                    const u2* temp = insns;
-                    temp += offset;
-                    std::vector<int> tempInsOffsets = *insOffsets;
-                    std::map<u2, std::vector<ObjectAccInfo*> > tempInterest = *interestRegObjMap;
-                    int newDepth = depth + 1;
-                    // If we reach the maximum branch depth, we exit the parse of the method to save the cost of parse
-                    if(newDepth >= MaxBranchDepth) {
-                        for(unsigned int i = 0; i < methodAccInfo->args->size(); i++) {
-                            flagObjAll(methodAccInfo->args->at(i));
-                        }
-                        *exitMethod = true;
-                        return;
-                    }
-                    parseInsns(temp, methodAccInfo, chain, &tempInsOffsets, &tempInterest, newDepth, exitMethod);
+                    toParse->lastop = opcode;
+                    ParseInfo* branchParseInfo = new ParseInfo();
+                    copyParseInfo(toParse, branchParseInfo);
+                    branchParseInfo->insoff = newOffset;
+                    executions.insert(branchParseInfo);
                 }
             }
         } else if(opcode == OP_INSTANCE_OF || opcode == OP_NEW_ARRAY || opcode == OP_CONST_4 || opcode == OP_NEG_INT || opcode == OP_NOT_INT
@@ -1985,76 +2024,18 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
             vdst = inst_aa(insns);
             interestRegObjMap->erase(vdst);
         } else if(opcode == OP_THROW) {
-            return;
+            endParse(methodAccInfo, toParse, &executions);
+            continue;
         } else if(opcode == OP_CONST_CLASS) {
             // TODO: check if need to to any operation
             vdst = inst_aa(insns);
             interestRegObjMap->erase(vdst);
         } else if(opcode == OP_MONITOR_ENTER || opcode == OP_MONITOR_EXIT) {// we set this field as always need to be migrated
-            /*/ set the lock of the object as need to be migrated
-            vsrc1 = inst_aa(insns);
-            // check if the source register is in our interest list
-            if(interestRegObjMap->find(vsrc1) == interestRegObjMap->end()) {
-                continue;
-            }
-            // for comet code, this offset is 3 since it has added two more fields before lock field, or it is 1
-            unsigned int offset = 3;
-                        
-            // set the field of the object as accessed
-            std::vector<ObjectAccInfo*> accVector = (*interestRegObjMap)[vsrc1];
-            for(unsigned int i = 0; i < accVector.size(); i++) {
-                ObjectAccInfo* objAccInfo = accVector.at(i);
-                assert(objAccInfo != NULL);
-                // the current size are not big enough, it means that the field is not set by other instruction and its access is to the field of the object
-                if(objAccInfo->trackSet.size() < offset + 1) {
-                    // resize the vector to accomodate the offset
-                    objAccInfo->fieldSet.resize(offset + 1);
-                    objAccInfo->trackSet.resize(offset + 1);
-                }
-                // if the field has not been setup, then set the field
-                if(objAccInfo->trackSet[offset] == NULL) {
-                    ObjectAccInfo* fieldInfo = new ObjectAccInfo();
-                    fieldInfo->belonging = objAccInfo;
-                    objAccInfo->fieldSet[offset] = fieldInfo;
-                    objAccInfo->trackSet[offset] = new std::vector<ObjectAccInfo*>();
-                    objAccInfo->trackSet[offset]->push_back(objAccInfo->fieldSet[offset]);
-                }
-            }*/
-        } else if(opcode == OP_CHECK_CAST || opcode == OP_FILL_ARRAY_DATA
-            || opcode == OP_UNUSED_3E || opcode == OP_UNUSED_3F || opcode == OP_UNUSED_40
-            || opcode == OP_UNUSED_41 || opcode == OP_UNUSED_42 || opcode == OP_UNUSED_43
-            || opcode == OP_UNUSED_73 || opcode == OP_UNUSED_79 || opcode == OP_UNUSED_7A) {
+            // do nothing
+        } else if(opcode == OP_CHECK_CAST || opcode == OP_FILL_ARRAY_DATA) {
             // do nothing
         } else if(opcode == OP_ARRAY_LENGTH)  { // we would migrate the length of array anyway
             vdst = inst_a(insns);
-            /*vsrc1 = inst_b(insns);
-            // check if the source register is in our interest list
-            if(interestRegObjMap->find(vsrc1) == interestRegObjMap->end()) {
-                continue;
-            }
-            // for comet code, this offset is 4 since it has added two more fields in Object struct, or it is 2
-            unsigned int offset = 4;
-                        
-            // set the field of the object as accessed
-            std::vector<ObjectAccInfo*> accVector = (*interestRegObjMap)[vsrc1];
-            for(unsigned int i = 0; i < accVector.size(); i++) {
-                ObjectAccInfo* objAccInfo = accVector.at(i);
-                assert(objAccInfo != NULL);
-                // the current size are not big enough, it means that the field is not set by other instruction and its access is to the field of the object
-                if(objAccInfo->trackSet.size() < offset + 1) {
-                    // resize the vector to accomodate the offset
-                    objAccInfo->fieldSet.resize(offset + 1);
-                    objAccInfo->trackSet.resize(offset + 1);
-                }
-                // if the field has not been setup, then set the field
-                if(objAccInfo->trackSet[offset] == NULL) {
-                    ObjectAccInfo* fieldInfo = new ObjectAccInfo();
-                    fieldInfo->belonging = objAccInfo;
-                    objAccInfo->fieldSet[offset] = fieldInfo;
-                    objAccInfo->trackSet[offset] = new std::vector<ObjectAccInfo*>();
-                    objAccInfo->trackSet[offset]->push_back(objAccInfo->fieldSet[offset]);
-                }
-            }*/
             // erase to set the result not be interest any more
             interestRegObjMap->erase(vdst);
         } else if(opcode == OP_FILLED_NEW_ARRAY || opcode == OP_FILLED_NEW_ARRAY_RANGE) {
@@ -2090,6 +2071,7 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
                     vdst >>= 4;
                 }
             }
+            toParse->affectTry = true;
         } else if(opcode == OP_AGET || opcode == OP_AGET_WIDE || opcode == OP_AGET_OBJECT
             || opcode == OP_AGET_BOOLEAN || opcode == OP_AGET_BYTE || opcode == OP_AGET_CHAR
             || opcode == OP_AGET_SHORT) {
@@ -2100,20 +2082,17 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
                 flagVecAll(&((*interestRegObjMap)[vsrc1]));
             }
             interestRegObjMap->erase(vdst);
-            ObjectAccInfo* objAccInfo = new ObjectAccInfo();
-            objAccInfo->allFlag = true;
-            objAccInfo->inArray = true;
-            (*interestRegObjMap)[vdst].push_back(objAccInfo);
+            if(opcode == OP_AGET_OBJECT) {
+                ObjectAccInfo* objAccInfo = new ObjectAccInfo();
+                objAccInfo->allFlag = true;
+                objAccInfo->inArray = true;
+                (*interestRegObjMap)[vdst].insert(objAccInfo);
+            }
+            toParse->affectTry = true;
         } else if(opcode == OP_APUT_OBJECT) {
             vdst = inst_aa(insns);
             flagVecAllArray(&((*interestRegObjMap)[vdst]));
-            /*u2 arrayInfo = insns[1];
-            vsrc1 = arrayInfo & 0xff;
-            if(interestRegObjMap->find(vdst) != interestRegObjMap->end()) {
-                // if array register is not in the interest list, add it
-                pushVec(&((*interestRegObjMap)[vsrc1]), &((*interestRegObjMap)[vdst]));
-            } else {
-            }*/
+            toParse->affectTry = true;
         } else if(opcode == OP_IPUT || opcode == OP_IPUT_WIDE || opcode == OP_IPUT_BOOLEAN 
             || opcode == OP_IPUT_BYTE || opcode == OP_IPUT_CHAR || opcode == OP_IPUT_SHORT 
             || opcode == OP_IPUT_VOLATILE || opcode == OP_IPUT_WIDE_VOLATILE
@@ -2123,67 +2102,64 @@ void parseInsns(const u2* insns, MethodAccInfo* methodAccInfo, std::set<Method*>
             || opcode == OP_APUT || opcode == OP_APUT_WIDE || opcode == OP_APUT_BOOLEAN
             || opcode == OP_APUT_BYTE || opcode == OP_APUT_CHAR || opcode == OP_APUT_SHORT) {
             // do nothing
+        } else if(opcode == OP_UNUSED_3E || opcode == OP_UNUSED_3F || opcode == OP_UNUSED_40
+            || opcode == OP_UNUSED_41 || opcode == OP_UNUSED_42 || opcode == OP_UNUSED_43
+            || opcode == OP_UNUSED_73 || opcode == OP_UNUSED_79 || opcode == OP_UNUSED_7A
+            || opcode == OP_UNUSED_FF) {
+            ALOGE("encountering error instruction code, opcode is: %d", opcode);
         } else {
             ALOGE("methodParser unrecognizable opcode: %d", opcode);
         }
+finally:
+        toParse->insoff += width;
+        toParse->lastop = opcode;
+        if(!checkInterest(toParse)) {
+			ALOGE("got opcode with obj not in methodaccinfo, opcode: %d", opcode);
+        }
     }
+    //ALOGE("method %s.%s has %d branches, catch branches:%d, mergecount: %d", method->clazz->descriptor, method->name, branches, catchBranches, mergecount);
 }
 
-MethodAccInfo* parseMethod(Method* method, std::set<Method*>* chain) {
-    if(methodResMap.find(method) != methodResMap.end()) {
-        return methodResMap[method];
+void parseMethod(MethodAccInfo* methodAccInfo, std::vector<Method*>* chain) {
+    Method* method = methodAccInfo->method;
+    /*if(strcmp(method->clazz->descriptor, "Ldalvik/system/DexFile;") == 0
+            && strcmp(method->name, "<init>") == 0
+            && method->idx == 79) {
+        ALOGE("offset map has it or not: %d", parsedMethodOffMap->find(method) != parsedMethodOffMap->end());
+    }*/
+    if(parsedMethodOffMap->find(method) != parsedMethodOffMap->end()) {
+        ParsedMethoOffInfo* poffInfo = (*parsedMethodOffMap)[method];
+        loadStructureInFile(methodAccInfo, poffInfo->offStart, poffInfo->length);
+        return;
     }
-    MethodAccInfo* methodAccInfo = new MethodAccInfo();
-    methodAccInfo->method = method;
     populateMethodAccInfo(methodAccInfo);
     bool isCycle = false;
     // check if this method makes an invocation cycle, if true, then set all the parameters as need to be migrate all
-    if(chain->find(method) != chain->end()) {
-        isCycle = true;
+    for(unsigned int i = 0; i < chain->size(); i++) {
+        if(method == chain->at(i)) {
+            isCycle = true;
+        }
     }
     // a method invocation cycle, an abstract or native method cannot be parsed, then we just set all the parameters as need migration
     if(isCycle || dvmIsNativeMethod(method) || dvmIsAbstractMethod(method)) {
         for(unsigned int idx = 0; idx < methodAccInfo->args->size(); idx++) {
             flagObjAll(methodAccInfo->args->at(idx));
         }
-        methodResMap[method] = methodAccInfo;
-        return methodAccInfo;
+        persistMethodAllInfo(methodAccInfo);
+        return;
     }
-    chain->insert(method);
+    chain->push_back(method);
     // declare a map which will contain the list of registers the method should track
     // in each register, we use a vector to track all the possible object this vector might store
-    std::map<u2, std::vector<ObjectAccInfo*> > interestRegObjMap;
-    // sets the count to be the number of arguments and initiate them, and initialize interest registers
-    DexParameterIterator iterator;
-    const char* descriptor;
-    dexParameterIteratorInit(&iterator, &method->prototype);
-    for(int i = 0; i < method->insSize; i++) {
-        if(i == 0 && !dvmIsStaticMethod(method)) {
-            interestRegObjMap[method->registersSize - method->insSize + i].push_back(methodAccInfo->args->at(i));
-        }
-        if(i > 0 || dvmIsStaticMethod(method)) {
-            descriptor = dexParameterIteratorNextDescriptor(&iterator);
-            if(descriptor == NULL) {
-                //ALOGE("methodParser find NULL descriptor, insSize: %d, i: %d, method: %s.%s", method->insSize, i, method->clazz->descriptor, method->name);
-                break;
-            }
-            // we only cares object parameter
-            if(*descriptor == 'L' || *descriptor == '[') {
-                interestRegObjMap[method->registersSize - method->insSize + i].push_back(methodAccInfo->args->at(i));
-            }
-        }
-    }
     const u2* insns = method->insns;
     //u4 insnsSize = dvmGetMethodInsnsSize(method);
-    std::vector<int> insOffsets;
     int depth = 0;
     bool exitMethod = false;
-    parseInsns(insns, methodAccInfo, chain, &insOffsets, &interestRegObjMap, depth, &exitMethod);
+    parseInsns(insns, methodAccInfo, chain, depth, &exitMethod);
     
-    chain->erase(method);
-    methodResMap[method] = methodAccInfo;
-    
-    return methodAccInfo;
+    chain->pop_back();
+
+    persistMethodAllInfo(methodAccInfo);
 }
 
 std::vector<ClassObject*>* findSubClass(ClassObject* clazz) {
@@ -2325,6 +2301,677 @@ void persistMethodInfo(MethodAccInfo* methodAccInfo, const char* fileName) {
     dstfile.close();
 }
 
+static void indexObjList(std::queue<ObjectAccInfo*>* frontier, std::vector<ObjectAccInfo*>* objList) {
+    int index = objList->size();
+    while(!frontier->empty()) {
+        ObjectAccInfo* objAccInfo = frontier->front();
+        frontier->pop();
+        if(objAccInfo->idx >= 0) {
+            continue;
+        }
+        objAccInfo->idx = index++;
+        objList->push_back(objAccInfo);
+        for(unsigned int i = 0; i < objAccInfo->fieldSet.size(); i++) {
+            if(objAccInfo->fieldSet[i] != NULL) {
+                frontier->push(objAccInfo->fieldSet[i]);
+            }
+            if(objAccInfo->trackSet[i] != NULL) {
+                for(std::set<ObjectAccInfo*>::iterator it = objAccInfo->trackSet[i]->begin(); it != objAccInfo->trackSet[i]->end(); ++it) {
+                    frontier->push(*it);
+                }
+            }
+        }
+    }
+}
+
+/* set the index no for each objectAccInfo */
+static void indexMethodAccInfo(MethodAccInfo* methodAccInfo, std::vector<ObjectAccInfo*>* objList) {
+    std::queue<ObjectAccInfo*> frontier;
+    for(unsigned int i = 0; i < methodAccInfo->globalClazz->size(); i++) {
+        frontier.push(methodAccInfo->globalClazz->at(i));
+    }
+    for(unsigned int i = 0; i < methodAccInfo->args->size(); i++) {
+        frontier.push(methodAccInfo->args->at(i));
+    }
+
+    indexObjList(&frontier, objList);
+}
+
+static void indexRegObj(std::map<u2, std::set<ObjectAccInfo*> >* interestRegObjMap, std::vector<ObjectAccInfo*>* objList) {
+    std::queue<ObjectAccInfo*> frontier;
+    for(std::map<u2, std::set<ObjectAccInfo*> >::iterator mapit = interestRegObjMap->begin(); mapit != interestRegObjMap->end(); ++mapit) {
+        for(std::set<ObjectAccInfo*>::iterator setit = mapit->second.begin(); setit != mapit->second.end(); ++setit) {
+            if(*setit != NULL) {
+                if((*setit)->idx == -1) {
+                    frontier.push(*setit);
+                }
+            }
+        }
+    }
+
+    indexObjList(&frontier, objList);
+}
+
+static void clearIndex(std::vector<ObjectAccInfo*>* objList) {
+    for(unsigned int i = 0; i < objList->size(); i++) {
+        objList->at(i)->idx = -1;
+    }
+}
+
+static bool checkInterest(ParseInfo* parseInfo) {
+    std::vector<ObjectAccInfo*> objList;
+    indexMethodAccInfo(parseInfo->methodAccInfo, &objList);
+    indexRegObj(parseInfo->interestRegObjMap, &objList);
+    for(std::map<u2, std::set<ObjectAccInfo*> >::iterator it = parseInfo->interestRegObjMap->begin(); it != parseInfo->interestRegObjMap->end(); ++it) {
+        for(std::set<ObjectAccInfo*>::iterator setit = it->second.begin(); setit != it->second.end(); setit++) {
+            if(*setit == NULL) {
+                ALOGE("got an error that an reg value is NULL");
+				clearIndex(&objList);
+				return false;
+			}
+        }
+    }
+    clearIndex(&objList);
+	return true;
+}
+
+static void copyParseInfo(ParseInfo* src, ParseInfo* dst) {
+    dst->insoff = src->insoff;
+    dst->lastop = src->lastop;
+    dst->insOffsets = new std::set<int>(src->insOffsets->begin(), src->insOffsets->end());
+
+    // copy MethodAccInfo
+    MethodAccInfo* srcMethAccInfo = src->methodAccInfo;
+    MethodAccInfo* dstMethAccInfo = new MethodAccInfo();
+    dst->methodAccInfo = dstMethAccInfo;
+    dstMethAccInfo->method = srcMethAccInfo->method;
+    populateMethodAccInfo(dstMethAccInfo);
+    std::vector<ObjectAccInfo*> objList;
+    indexMethodAccInfo(srcMethAccInfo, &objList);
+    indexRegObj(src->interestRegObjMap, &objList);
+    std::vector<ObjectAccInfo*> newObjList;
+    unsigned int currIdx = 0;
+    if(srcMethAccInfo->globalClazz != NULL) {
+        currIdx += srcMethAccInfo->globalClazz->size();
+        dstMethAccInfo->globalClazz = new std::vector<ClazzAccInfo*>();
+        for(unsigned int i = 0; i < srcMethAccInfo->globalClazz->size(); i++) {
+            ClazzAccInfo* clzAccInfo = new ClazzAccInfo();
+            newObjList.push_back(clzAccInfo);
+            clzAccInfo->clazz = srcMethAccInfo->globalClazz->at(i)->clazz;
+            dstMethAccInfo->globalClazz->push_back(clzAccInfo);
+        }
+    }
+    if(srcMethAccInfo->args != NULL) {
+        currIdx += srcMethAccInfo->args->size();
+        dstMethAccInfo->args = new std::vector<ObjectAccInfo*>();
+        for(unsigned int i = 0; i < srcMethAccInfo->args->size(); i++) {
+            ObjectAccInfo* objAccInfo = new ObjectAccInfo();
+            newObjList.push_back(objAccInfo);
+            dstMethAccInfo->args->push_back(objAccInfo);
+        }
+    }
+    for(unsigned int i = currIdx; i < objList.size(); i++) {
+        newObjList.push_back(new ObjectAccInfo());
+    }
+
+    // fill the structure infomation into the new objects list
+    for(unsigned int i = 0; i < objList.size(); i++) {
+        ObjectAccInfo* srcAccInfo = objList.at(i);
+        ObjectAccInfo* dstAccInfo = newObjList.at(i);
+        dstAccInfo->allFlag = srcAccInfo->allFlag;
+        dstAccInfo->inArray = srcAccInfo->inArray;
+        if(srcAccInfo->belonging != NULL) {
+            dstAccInfo->belonging = newObjList[srcAccInfo->belonging->idx];
+        }
+        dstAccInfo->nullBranchFlags.resize(srcAccInfo->fieldSet.size());
+        dstAccInfo->fieldSet.resize(srcAccInfo->fieldSet.size());
+        dstAccInfo->trackSet.resize(srcAccInfo->trackSet.size());
+        for(unsigned int j = 0; j < srcAccInfo->fieldSet.size(); j++) {
+            dstAccInfo->nullBranchFlags[j] = srcAccInfo->nullBranchFlags[j];
+            if(srcAccInfo->fieldSet[j] != NULL) {
+                dstAccInfo->fieldSet[j] = newObjList[srcAccInfo->fieldSet[j]->idx];
+            }
+            if(srcAccInfo->trackSet[j] != NULL) {
+                dstAccInfo->trackSet[j] = new std::set<ObjectAccInfo*>();
+                for(std::set<ObjectAccInfo*>::iterator it = srcAccInfo->trackSet[j]->begin(); it != srcAccInfo->trackSet[j]->end(); ++it) {
+                    dstAccInfo->trackSet[j]->insert(newObjList[(*it)->idx]);
+                }
+            }
+        }
+    }
+
+    // copy interesting register maps
+    dst->interestRegObjMap = new std::map<u2, std::set<ObjectAccInfo*> >();
+    for(std::map<u2, std::set<ObjectAccInfo*> >::iterator mapit = src->interestRegObjMap->begin(); mapit != src->interestRegObjMap->end(); ++mapit) {
+        for(std::set<ObjectAccInfo*>::iterator setit = mapit->second.begin(); setit != mapit->second.end(); ++setit) {
+            (*(dst->interestRegObjMap))[mapit->first].insert(newObjList[(*setit)->idx]);
+        }
+    }
+
+    clearIndex(&objList);
+}
+
+/* save ObjectAccInfo with structure */
+static void saveStructureToFile(MethodAccInfo* methodAccInfo, std::vector<ObjectAccInfo*>* objList) {
+    // output method identification
+    presultFileTxt << methodAccInfo->method->clazz->descriptor << " " << methodAccInfo->method->name << " " << methodAccInfo->method->idx << std::endl;
+    presultFileTxt << methodAccInfo->globalClazz->size() << " " << methodAccInfo->args->size() << std::endl;
+    for(unsigned int i = 0; i < objList->size(); i++) {
+        ObjectAccInfo* objAccInfo = objList->at(i);
+        presultFileTxt << objAccInfo->idx << " " << objAccInfo->allFlag << " " << objAccInfo->inArray << " ";
+        for(unsigned int j = 0; j < objAccInfo->nullBranchFlags.size(); j++) {
+            presultFileTxt << objAccInfo->nullBranchFlags[j];
+        }
+        presultFileTxt << " ";
+        for(unsigned int j = 0; j < objAccInfo->fieldSet.size(); j++) {
+            if(j != 0) {
+                presultFileTxt << '|';
+            }
+            if(objAccInfo->fieldSet[j] == NULL) {
+                presultFileTxt << 0;
+            } else {
+                presultFileTxt << objAccInfo->fieldSet[j]->idx;
+            }
+        }
+        presultFileTxt << " ";
+        for(unsigned int j = 0; j < objAccInfo->trackSet.size(); j++) {
+            if(j != 0) {
+                presultFileTxt << '|';
+            }
+            if(objAccInfo->trackSet[j] == NULL) {
+                presultFileTxt << 0;
+            } else {
+                int first = true;
+                for(std::set<ObjectAccInfo*>::iterator it = objAccInfo->trackSet[j]->begin(); it != objAccInfo->trackSet[j]->end(); ++it) {
+                    if(!first) {
+                        presultFileTxt << ',';
+                    }
+                    presultFileTxt << (*it)->idx;
+                    first = false;
+                }
+            }
+        }
+        presultFileTxt << " ";
+        if(i < methodAccInfo->globalClazz->size()) {
+            presultFileTxt << methodAccInfo->globalClazz->at(i)->clazz->descriptor;
+        }
+        presultFileTxt << std::endl;
+    }
+}
+
+static void saveStructureToBFile(MethodAccInfo* methodAccInfo, std::vector<ObjectAccInfo*>* objList) {
+    std::streampos begin, end, end2;
+    presultFile.seekp(0, std::ios::beg);
+    begin = presultFile.tellp();
+    presultFile.seekp(0, std::ios::end);
+    end = presultFile.tellp();
+    int offStart = end - begin;
+    int objIdxSize = sizeof((ObjectAccInfo *)0)->idx;
+    // output method identification
+    int clzNameIdx = (*strOffMap)[methodAccInfo->method->clazz->descriptor];
+    presultFile.write(reinterpret_cast<char*>(&clzNameIdx), sizeof(clzNameIdx));
+    int methNameIdx = (*strOffMap)[methodAccInfo->method->name];
+    presultFile.write(reinterpret_cast<char*>(&methNameIdx), sizeof(methNameIdx));
+    presultFile.write(reinterpret_cast<char*>(&(methodAccInfo->method->idx)), sizeof(methodAccInfo->method->idx));
+    unsigned int clzsize = methodAccInfo->globalClazz->size();
+    presultFile.write(reinterpret_cast<char*>(&clzsize), sizeof(clzsize));
+    unsigned int argsize = methodAccInfo->args->size();
+    presultFile.write(reinterpret_cast<char*>(&argsize), sizeof(argsize));
+    unsigned int objsize = objList->size();
+    presultFile.write(reinterpret_cast<char*>(&objsize), sizeof(objsize));
+    int zero = 0;
+    int none = -1;
+    for(unsigned int i = 0; i < objList->size(); i++) {
+        ObjectAccInfo* objAccInfo = objList->at(i);
+        presultFile.write(reinterpret_cast<char*>(&(objAccInfo->idx)), sizeof(objAccInfo->idx));
+        presultFile.write(reinterpret_cast<char*>(&(objAccInfo->allFlag)), sizeof(objAccInfo->allFlag));
+        presultFile.write(reinterpret_cast<char*>(&(objAccInfo->inArray)), sizeof(objAccInfo->inArray));
+        unsigned int fsetsize = objAccInfo->fieldSet.size();
+        presultFile.write(reinterpret_cast<char*>(&fsetsize), sizeof(fsetsize));
+        for(unsigned int j = 0; j < objAccInfo->nullBranchFlags.size(); j++) {
+            bool isnullbranch = objAccInfo->nullBranchFlags[j];
+            presultFile.write(reinterpret_cast<char*>(&isnullbranch), sizeof(isnullbranch));
+        }
+        for(unsigned int j = 0; j < objAccInfo->fieldSet.size(); j++) {
+            if(objAccInfo->fieldSet[j] == NULL) {
+                presultFile.write(reinterpret_cast<char*>(&none), objIdxSize);
+            } else {
+                presultFile.write(reinterpret_cast<char*>(&(objAccInfo->fieldSet[j]->idx)), sizeof(objAccInfo->fieldSet[j]->idx));
+            }
+        }
+        for(unsigned int j = 0; j < objAccInfo->trackSet.size(); j++) {
+            if(objAccInfo->trackSet[j] == NULL) {
+                presultFile.write(reinterpret_cast<char*>(&zero), objIdxSize);
+            } else {
+                unsigned int tracksize = objAccInfo->trackSet[j]->size();
+                presultFile.write(reinterpret_cast<char*>(&tracksize), sizeof(tracksize));
+                for(std::set<ObjectAccInfo*>::iterator it = objAccInfo->trackSet[j]->begin(); it != objAccInfo->trackSet[j]->end(); ++it) {
+                    presultFile.write(reinterpret_cast<char*>(&((*it)->idx)), sizeof((*it)->idx));
+                }
+            }
+        }
+        if(i < methodAccInfo->globalClazz->size()) {
+            int gclzNameIdx = (*strOffMap)[methodAccInfo->globalClazz->at(i)->clazz->descriptor];
+            presultFile.write(reinterpret_cast<char*>(&gclzNameIdx), sizeof(gclzNameIdx));
+        }
+    }
+    presultFile.seekp(0, std::ios::end);
+    end2 = presultFile.tellp();
+    int length = end2 - end;
+    poffFile.seekp(0, std::ios::end);
+    poffFile.write(reinterpret_cast<char*>(&clzNameIdx), sizeof(clzNameIdx));
+    poffFile.write(reinterpret_cast<char*>(&methNameIdx), sizeof(methNameIdx));
+    poffFile.write(reinterpret_cast<char*>(&(methodAccInfo->method->idx)), sizeof(methodAccInfo->method->idx));
+    poffFile.write(reinterpret_cast<char*>(&offStart), sizeof(offStart));
+    poffFile.write(reinterpret_cast<char*>(&length), sizeof(length));
+    ParsedMethoOffInfo* offInfo = new ParsedMethoOffInfo();
+    offInfo->offStart = offStart;
+    offInfo->length = length;
+    (*parsedMethodOffMap)[methodAccInfo->method] = offInfo;
+}
+
+void persistMethodAllInfo(MethodAccInfo* methodAccInfo) {
+    std::vector<ObjectAccInfo*> objList;
+    indexMethodAccInfo(methodAccInfo, &objList);
+    saveStructureToFile(methodAccInfo, &objList);
+    saveStructureToBFile(methodAccInfo, &objList);
+}
+
+void createStringDict() {
+    std::map<const char*, int, charscomp> strdict;
+    int offset = 0;
+    for(unsigned int idx = 0; idx < loadedDex.size(); idx++) {
+        DvmDex* pDvmDex;
+        pDvmDex = loadedDex[idx];
+        for(unsigned int i = 0; i < pDvmDex->pHeader->classDefsSize; i++) {
+            const DexClassDef pClassDef = pDvmDex->pDexFile->pClassDefs[i];
+            ClassObject* resClass;  // this segment is copied from Resolve.cpp - dvmResolveClass()
+            const char* className;
+            className = dexStringByTypeIdx(pDvmDex->pDexFile, pClassDef.classIdx);
+            if(className[0] != '\0' && className[1] == '\0') {
+                /* primitive type */
+                resClass = dvmFindPrimitiveClass(className[0]);
+            } else {
+                resClass = dvmLookupClass(className, NULL, false);
+            }
+            if(resClass == NULL) {
+                ALOGE("find unloaded class: %s", className);
+                continue;
+            }
+            if(strdict.find(className) == strdict.end()) {
+                strdict[className] = offset++;
+            }
+            // traverse and parse every method in the class, see Object.cpp - findMethodInListByDescriptor
+            Method* vmethods = resClass->virtualMethods;
+            size_t vmethodCount = resClass->virtualMethodCount;
+            for(size_t j = 0; j < vmethodCount; j++) {
+                Method* method = &vmethods[j];
+                if(strdict.find(method->name) == strdict.end()) {
+                    strdict[method->name] = offset++;
+                }
+            }
+            Method* dmethods = resClass->directMethods;
+            size_t dmethodCount = resClass->directMethodCount;
+            for(size_t j = 0; j < dmethodCount; j++) {
+                Method* method = &dmethods[j];
+                if(strdict.find(method->name) == strdict.end()) {
+                    strdict[method->name] = offset++;
+                }
+            }
+        }
+    }
+    char terminCh = '\0';
+    strDictFile.seekp(0, std::ios::end);
+    for(std::map<const char*, int, charscomp>::iterator it = strdict.begin(); it != strdict.end(); ++it) {
+        strDictFile.write(it->first, strlen(it->first));
+        strDictFile.write(&terminCh, 1);
+        strDictFile.write(reinterpret_cast<char*>(&(it->second)), sizeof(int));
+    }
+}
+
+void loadStringDict() {
+    std::streampos begin, end;
+    strDictFile.seekg(0, std::ios::end);
+    end = strDictFile.tellg();
+    strDictFile.seekg(0, std::ios::beg);
+    begin = strDictFile.tellg();
+    unsigned int total = end - begin;
+    char readbuffer[total];
+    strDictFile.read(readbuffer, total);
+    char* buffer = readbuffer;
+    int leftbytes = total;
+    while(leftbytes > 0) {
+        int index = 0;
+        while(buffer[index] != '\0') {
+            index++;
+        }
+        char* str = new char[index + 1];
+        memcpy(str, buffer, index);
+        str[index] = '\0';
+        buffer += (index + 1);
+        int offset;
+        memcpy(&offset, buffer, sizeof(offset));
+        buffer += sizeof(offset);
+        leftbytes -= (index + 1 + sizeof(offset));
+        (*strOffMap)[str] = offset;
+        (*offStrMap)[offset] = str;
+    }
+}
+
+void loadParsedMethodOffInfo() {
+    std::streampos begin, end;
+    poffFile.seekg(0, std::ios::end);
+    end = poffFile.tellg();
+    poffFile.seekg(0, std::ios::beg);
+    begin = poffFile.tellg();
+    unsigned int total = end - begin;
+    char readbuffer[total];
+    poffFile.read(readbuffer, total);
+    char* buffer = readbuffer;
+    int leftbytes = total;
+    while(leftbytes > 0) {
+        int clzNameIdx;
+        memcpy(&clzNameIdx, buffer, sizeof(clzNameIdx));
+        buffer += sizeof(clzNameIdx);
+        leftbytes -= sizeof(clzNameIdx);
+        ClassObject* clazz = dvmLookupClass((*offStrMap)[clzNameIdx], NULL, false);
+        int methNameIdx;
+        memcpy(&methNameIdx, buffer, sizeof(methNameIdx));
+        buffer += sizeof(methNameIdx);
+        leftbytes -= sizeof(methNameIdx);
+        const char* methodName = (*offStrMap)[methNameIdx];
+        unsigned int methodIdx;
+        memcpy(&methodIdx, buffer, sizeof(methodIdx));
+        buffer += sizeof(methodIdx);
+        leftbytes -= sizeof(methodIdx);
+        // find the specified method reference
+        Method* offmethod;
+        bool found = false;
+        Method* vmethods = clazz->virtualMethods;
+        size_t vmethodCount = clazz->virtualMethodCount;
+        for(size_t j = 0; j < vmethodCount; j++) {
+            Method* method = &vmethods[j];
+            if(strcmp(method->name, methodName) == 0 && method->idx == methodIdx) {
+                offmethod = method;
+                found = true;
+                break;
+            }
+        }
+        if(!found) {
+            Method* dmethods = clazz->directMethods;
+            size_t dmethodCount = clazz->directMethodCount;
+            for(size_t j = 0; j < dmethodCount; j++) {
+                Method* method = &dmethods[j];
+                if(strcmp(method->name, methodName) == 0 && method->idx == methodIdx) {
+                    offmethod = method;
+                    break;
+                }
+            }
+        }
+
+        int offStart;
+        memcpy(&offStart, buffer, sizeof(offStart));
+        buffer += sizeof(offStart);
+        leftbytes -= sizeof(offStart);
+        int length;
+        memcpy(&length, buffer, sizeof(length));
+        buffer += sizeof(length);
+        leftbytes -= sizeof(length);
+
+        ParsedMethoOffInfo* offInfo = new ParsedMethoOffInfo();
+        offInfo->offStart = offStart;
+        offInfo->length = length;
+        (*parsedMethodOffMap)[offmethod] = offInfo;
+    }
+}
+
+static void loadStructureInFile(MethodAccInfo* methodAccInfo, int offStart, int length) {
+    std::map<int, ObjectAccInfo*> idObjMap;
+    presultFile.seekg(offStart, std::ios::beg);
+    char readbuffer[length];
+    if(offStart == 159789083 && length == 28005383) {
+        char* newreadbuffer = (char*) malloc(length + 1);
+        presultFile.read(newreadbuffer, length);
+        ALOGE("read for the problem size is: %d, length is: %d", presultFile.gcount(), length);
+    }
+    presultFile.read(readbuffer, length);
+    char* buffer = readbuffer;
+	int clzNameIdx;
+	memcpy(&clzNameIdx, buffer, sizeof(clzNameIdx));
+    buffer += sizeof(clzNameIdx);
+    ClassObject* clazz = dvmLookupClass((*offStrMap)[clzNameIdx], NULL, false);
+	int methNameIdx;
+	memcpy(&methNameIdx, buffer, sizeof(methNameIdx));
+	buffer += sizeof(methNameIdx);
+    const char* methodName = (*offStrMap)[methNameIdx];
+    unsigned int methodIdx;
+	memcpy(&methodIdx, buffer, sizeof(methodIdx));
+    buffer += sizeof(methodIdx);
+    // find the specified method reference
+    bool found = false;
+    Method* vmethods = clazz->virtualMethods;
+    size_t vmethodCount = clazz->virtualMethodCount;
+    for(size_t j = 0; j < vmethodCount; j++) {
+        Method* method = &vmethods[j];
+        if(strcmp(method->name, methodName) == 0 && method->idx == methodIdx) {
+            methodAccInfo->method = method;
+            found = true;
+            break;
+        }
+    }
+    if(!found) {
+        Method* dmethods = clazz->directMethods;
+        size_t dmethodCount = clazz->directMethodCount;
+        for(size_t j = 0; j < dmethodCount; j++) {
+            Method* method = &dmethods[j];
+            if(strcmp(method->name, methodName) == 0 && method->idx == methodIdx) {
+                methodAccInfo->method = method;
+                break;
+            }
+        }
+    }
+    methodAccInfo->args = new std::vector<ObjectAccInfo*>();
+    methodAccInfo->globalClazz = new std::vector<ClazzAccInfo*>();
+    unsigned int globalClzSize;
+    memcpy(&globalClzSize, buffer, sizeof(globalClzSize));
+	buffer += sizeof(globalClzSize);
+    unsigned int argSize;
+	memcpy(&argSize, buffer, sizeof(argSize));
+	buffer += sizeof(argSize);
+    unsigned int objSize;
+    memcpy(&objSize, buffer, sizeof(objSize));
+    buffer += sizeof(objSize);
+    for(unsigned int i = 0; i < globalClzSize; i++) {
+        ClazzAccInfo* clzAccInfo = new ClazzAccInfo();
+        idObjMap[i] = clzAccInfo;
+    }
+    for(unsigned int i = globalClzSize; i < objSize; i++) {
+        ObjectAccInfo* objAccInfo = new ObjectAccInfo();
+        idObjMap[i] = objAccInfo;
+    }
+    for(unsigned int i = 0; i < globalClzSize + argSize; i++) {
+        int objIdx;
+		memcpy(&objIdx, buffer, sizeof(objIdx));
+		buffer += sizeof(objIdx);
+        ObjectAccInfo* objAccInfo = idObjMap[objIdx];
+        if(i < globalClzSize) {
+            methodAccInfo->globalClazz->push_back((ClazzAccInfo*) objAccInfo);
+        } else {
+            methodAccInfo->args->push_back(objAccInfo);
+        }
+		bool allFlag;
+		memcpy(&allFlag, buffer, sizeof(allFlag));
+		buffer += sizeof(allFlag);
+        objAccInfo->allFlag = allFlag;
+		bool inArray;
+		memcpy(&inArray, buffer, sizeof(inArray));
+		buffer += sizeof(inArray);
+        objAccInfo->inArray = inArray;
+        unsigned int fSetSize;
+        memcpy(&fSetSize, buffer, sizeof(fSetSize));
+        buffer += sizeof(fSetSize);
+        objAccInfo->nullBranchFlags.resize(fSetSize);
+        for(unsigned int j = 0; j < fSetSize; j++) {
+            bool nullBFlag;
+            memcpy(&nullBFlag, buffer, sizeof(nullBFlag));
+            buffer += sizeof(nullBFlag);
+            objAccInfo->nullBranchFlags[j] = nullBFlag;
+        }
+        objAccInfo->fieldSet.resize(fSetSize);
+        for(unsigned int j = 0; j < fSetSize; j++) {
+            int fieldIdx;
+            memcpy(&fieldIdx, buffer, sizeof(fieldIdx));
+            buffer += sizeof(fieldIdx);
+            if(fieldIdx != -1) {
+                if(idObjMap.find(fieldIdx) == idObjMap.end()) {
+                    if((unsigned int) fieldIdx < globalClzSize) {
+                        ClazzAccInfo* fclzAccInfo = new ClazzAccInfo();
+                        idObjMap[fieldIdx] = fclzAccInfo;
+                    } else {
+                        ObjectAccInfo* fobjAccInfo = new ObjectAccInfo();
+                        idObjMap[fieldIdx] = fobjAccInfo;
+                    }
+                }
+                objAccInfo->fieldSet[j] = idObjMap[fieldIdx];
+            }
+        }
+        objAccInfo->trackSet.resize(fSetSize);
+        for(unsigned int j = 0; j < fSetSize; j++) {
+            unsigned int trackSize;
+            memcpy(&trackSize, buffer, sizeof(trackSize));
+            buffer += sizeof(trackSize);
+            if(trackSize > 0) {
+                objAccInfo->trackSet[j] = new std::set<ObjectAccInfo*>();
+            }
+            for(unsigned int k = 0; k < trackSize; k++) {
+                int trackIdx;
+                memcpy(&trackIdx, buffer, sizeof(trackIdx));
+                buffer += sizeof(trackIdx);
+                if(trackIdx != -1) {
+                    if(idObjMap.find(trackIdx) == idObjMap.end()) {
+                        if((unsigned int) trackIdx < globalClzSize) {
+                            ClazzAccInfo* tclzAccInfo = new ClazzAccInfo();
+                            idObjMap[trackIdx] = tclzAccInfo;
+                        } else {
+                            ObjectAccInfo* tobjAccInfo = new ObjectAccInfo();
+                            idObjMap[trackIdx] = tobjAccInfo;
+                        }
+                    }
+                    objAccInfo->trackSet[j]->insert(idObjMap[trackIdx]);
+                }
+            }
+        }
+        if(i < globalClzSize) {
+            int gclzNameIdx;
+            memcpy(&gclzNameIdx, buffer, sizeof(gclzNameIdx));
+            buffer += sizeof(gclzNameIdx);
+            ((ClazzAccInfo*) objAccInfo)->clazz = dvmLookupClass((*offStrMap)[gclzNameIdx], NULL, false);
+        }
+    }
+    for(unsigned int i = globalClzSize + argSize; i < objSize; i++) {
+        int objIdx;
+        memcpy(&objIdx, buffer, sizeof(objIdx));
+        buffer += sizeof(objIdx);
+        ObjectAccInfo* objAccInfo = idObjMap[objIdx];
+        bool allFlag;
+        memcpy(&allFlag, buffer, sizeof(allFlag));
+        buffer += sizeof(allFlag);
+        objAccInfo->allFlag = allFlag;
+        bool inArray;
+        memcpy(&inArray, buffer, sizeof(inArray));
+        buffer += sizeof(inArray);
+        objAccInfo->inArray = inArray;
+        unsigned int fSetSize;
+        memcpy(&fSetSize, buffer, sizeof(fSetSize));
+        buffer += sizeof(fSetSize);
+        objAccInfo->nullBranchFlags.resize(fSetSize);
+        for(unsigned int j = 0; j < fSetSize; j++) {
+            bool nullBFlag;
+            memcpy(&nullBFlag, buffer, sizeof(nullBFlag));
+            buffer += sizeof(nullBFlag);
+            objAccInfo->nullBranchFlags[j] = nullBFlag;
+        }
+        objAccInfo->fieldSet.resize(fSetSize);
+        for(unsigned int j = 0; j < fSetSize; j++) {
+            int fieldIdx;
+            memcpy(&fieldIdx, buffer, sizeof(fieldIdx));
+            buffer += sizeof(fieldIdx);
+            if(fieldIdx != -1) {
+                if(idObjMap.find(fieldIdx) == idObjMap.end()) {
+                    if((unsigned int) fieldIdx < globalClzSize) {
+                        ClazzAccInfo* fclzAccInfo = new ClazzAccInfo();
+                        idObjMap[fieldIdx] = fclzAccInfo;
+                    } else {
+                        ObjectAccInfo* fobjAccInfo = new ObjectAccInfo();
+                        idObjMap[fieldIdx] = fobjAccInfo;
+                    }
+                }
+                objAccInfo->fieldSet[j] = idObjMap[fieldIdx];
+            }
+        }
+        objAccInfo->trackSet.resize(fSetSize);
+        for(unsigned int j = 0; j < fSetSize; j++) {
+            unsigned int trackSize;
+            memcpy(&trackSize, buffer, sizeof(trackSize));
+            buffer += sizeof(trackSize);
+            if(trackSize > 0) {
+                objAccInfo->trackSet[j] = new std::set<ObjectAccInfo*>();
+            }
+            for(unsigned int k = 0; k < trackSize; k++) {
+                int trackIdx;
+                memcpy(&trackIdx, buffer, sizeof(trackIdx));
+                buffer += sizeof(trackIdx);
+                if(trackIdx != -1) {
+                    if(idObjMap.find(trackIdx) == idObjMap.end()) {
+                        if((unsigned int)trackIdx < globalClzSize) {
+                            ClazzAccInfo* tclzAccInfo = new ClazzAccInfo();
+                            idObjMap[trackIdx] = tclzAccInfo;
+                        } else {
+                            ObjectAccInfo* tobjAccInfo = new ObjectAccInfo();
+                            idObjMap[trackIdx] = tobjAccInfo;
+                        }
+                    }
+                    objAccInfo->trackSet[j]->insert(idObjMap[trackIdx]);
+                }
+            }
+        }
+    }
+}
+
+void freeMethodAccInfo(MethodAccInfo* methodAccInfo) {
+    std::vector<ObjectAccInfo*> objList;
+    indexMethodAccInfo(methodAccInfo, &objList);
+    for(unsigned int i = 0; i < objList.size(); i++) {
+        ObjectAccInfo* objAccInfo = objList.at(i);
+        for(unsigned int j = 0; j < objAccInfo->trackSet.size(); j++) {
+            if(objAccInfo->trackSet[j] != NULL) {
+                delete objAccInfo->trackSet[j];
+            }
+        }
+        delete objAccInfo;
+    }
+    if(methodAccInfo->args) {
+        delete methodAccInfo->args;
+    }
+    if(methodAccInfo->globalClazz != NULL) {
+        delete methodAccInfo->globalClazz;
+    }
+    if(methodAccInfo->returnObjs != NULL) {
+        delete methodAccInfo->returnObjs;
+    }
+    if(methodAccInfo->curMethodReturns != NULL) {
+        delete methodAccInfo->curMethodReturns;
+    }
+    delete methodAccInfo;
+}
+
+static void freeParseInfo(ParseInfo* parseInfo) {
+    freeMethodAccInfo(parseInfo->methodAccInfo);
+    delete parseInfo->interestRegObjMap;
+    delete parseInfo->insOffsets;
+    delete parseInfo;
+}
+
 void depthTraverseResult(ObjectAccResult* objAccResult, int depth) {
     if(objAccResult->allFlag) {
         //ALOGE("methodParser result depth: %d, allFlag is: %d", depth, objAccResult->allFlag);
@@ -2459,3 +3106,33 @@ void retrieveMethodInfo(std::map<char*, MethodAccResult*, charscomp>* methodAccM
     }
     srcfile.close();
 }
+
+void openFiles() {
+    char dictFileName[160];
+    strcpy(dictFileName, basePath);
+    strcat(dictFileName, "/strdict.bin");
+    strDictFile.open(dictFileName, std::ios::in | std::ios::out | std::ios::app | std::ios::binary);
+
+    char poffFileName[160];
+    strcpy(poffFileName, basePath);
+    strcat(poffFileName, "/poff.bin");
+    poffFile.open(poffFileName, std::ios::in | std::ios::out | std::ios::app | std::ios::binary);
+
+    char presultFileName[160];
+    strcpy(presultFileName, basePath);
+    strcat(presultFileName, "/presult.bin");
+    presultFile.open(presultFileName, std::ios::in | std::ios::out | std::ios::app | std::ios::binary);
+
+    char presultFileNameTxt[160];
+    strcpy(presultFileNameTxt, basePath);
+    strcat(presultFileNameTxt, "/presult.txt");
+    presultFileTxt.open(presultFileNameTxt, std::ios::in | std::ios::out | std::ios::app);
+}
+
+void closeFiles() {
+    strDictFile.close();
+    poffFile.close();
+    presultFile.close();
+    presultFileTxt.close();
+}
+

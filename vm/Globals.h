@@ -738,7 +738,6 @@ struct DvmGlobals {
     const char *lastMessage;
 
 #ifdef WITH_OFFLOAD
-    u4 changeCount;
     pthread_t       offControlThread;
 
     bool isServer;
@@ -757,8 +756,12 @@ struct DvmGlobals {
     
     // Modified by Yong map which stores the method access information
     std::map<char*, MethodAccResult*, charscomp>* methodAccMap;
+    // method class access offset cache
+    std::map<char*, u4, charscomp>* methodClzOffsetMap;
     // Add method execution time cache
-    std::map<const Method*, u8>* methodExeTimeMap;
+    std::map<const Method*, u4>* methodExePointMap;
+    // Add method execution times count
+    std::map<char*, u4, charscomp>* methodExeCountMap;
 
     // offload/Comm.h
     u4 nextId;
@@ -775,6 +778,9 @@ struct DvmGlobals {
     FifoBuffer      offProxyFifoAll;
 
     Vector offStatusUpdate;
+    
+    /* flag to indicate that if concurrent gc should be disabled */
+    bool            conGcDisabled;
 
     // offload/Engine.h
     bool            offDisabled;

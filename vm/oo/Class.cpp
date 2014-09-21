@@ -4594,6 +4594,11 @@ bool dvmInitClass(ClassObject* clazz) {
         JValue unused;
         dvmCallMethod(self, method, NULL, &unused);
     }
+#ifdef WITH_OFFLOAD
+        pthread_mutex_lock(&gDvm.offCommLock);
+        auxVectorPushL(&gDvm.offStatusUpdate, (Object*)clazz);
+        pthread_mutex_unlock(&gDvm.offCommLock);
+#endif
 
     if (dvmCheckException(self)) {
         /*
@@ -4608,20 +4613,10 @@ bool dvmInitClass(ClassObject* clazz) {
 
         dvmLockObject(self, (Object*) clazz);
         clazz->status = CLASS_ERROR;
-#ifdef WITH_OFFLOAD
-        pthread_mutex_lock(&gDvm.offCommLock);
-        auxVectorPushL(&gDvm.offStatusUpdate, (Object*)clazz);
-        pthread_mutex_unlock(&gDvm.offCommLock);
-#endif
     } else {
         /* success! */
         dvmLockObject(self, (Object*) clazz);
         clazz->status = CLASS_INITIALIZED;
-#ifdef WITH_OFFLOAD
-        pthread_mutex_lock(&gDvm.offCommLock);
-        auxVectorPushL(&gDvm.offStatusUpdate, (Object*)clazz);
-        pthread_mutex_unlock(&gDvm.offCommLock);
-#endif
         LOGVV("Initialized class: %s", clazz->descriptor);
 
 #ifdef WITH_OFFLOAD

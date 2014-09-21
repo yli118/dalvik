@@ -56,6 +56,8 @@
       break;                                                                \
     }
 
+std::ifstream staticfile;
+
 typedef struct MsgHeader {
   u4 id;
   u4 sz;
@@ -181,9 +183,9 @@ static void message_loop(int s) {
 #endif
       csent_bytes += ntohl(whdr.sz);
     } else if(wst == -1 && sent_bytes != sent_acked_bytes) {
-      ALOGI("WRITE[b, db, cb, dcb] = [%lld, %lld, %lld, %lld]",
-           sent_bytes, sent_bytes - sent_acked_bytes,
-           csent_bytes, csent_bytes - csent_acked_bytes);
+//      ALOGI("WRITE[b, db, cb, dcb] = [%lld, %lld, %lld, %lld]",
+//           sent_bytes, sent_bytes - sent_acked_bytes,
+//           csent_bytes, csent_bytes - csent_acked_bytes);
       sent_acked_bytes = sent_bytes;
       csent_acked_bytes = csent_bytes;
     }
@@ -234,9 +236,9 @@ static void message_loop(int s) {
           cread_bytes += rsz;
           read_bytes += sizeof(rbuftmp) - rstrm.avail_out;
           if(read_bytes - read_acked_bytes > (1<<10)) {
-            ALOGI("READ [b, db, cb, dcb] = [%lld, %lld, %lld, %lld]",
-                 read_bytes, read_bytes - read_acked_bytes,
-                 cread_bytes, cread_bytes - cread_acked_bytes);
+//            ALOGI("READ [b, db, cb, dcb] = [%lld, %lld, %lld, %lld]",
+//                 read_bytes, read_bytes - read_acked_bytes,
+//                 cread_bytes, cread_bytes - cread_acked_bytes);
             read_acked_bytes = read_bytes;
             cread_acked_bytes = cread_bytes;
           }
@@ -435,8 +437,24 @@ void* offControlLoop(void* junk) {
         getprocname(procname, 80);
         strcat(filename, procname);
         strcat(filename, "/parse.txt");
+        gDvm.methodAccMap = new std::map<char*, MethodAccResult*, charscomp>(); // todel
+        retrieveMethodInfo(gDvm.methodAccMap, filename); //todel
         
-        int openfd = open(filename, O_RDONLY, 0664);
+        gDvm.methodClzOffsetMap = new std::map<char*, u4, charscomp>();
+        char offsetfile[100];
+        strcpy(offsetfile, "/data/data/");
+        strcat(offsetfile, procname);
+        strcat(offsetfile, "/offset.txt");
+        retrieveOffsetMap(gDvm.methodClzOffsetMap, offsetfile);
+        
+        char staticfilename[100];
+        strcpy(staticfilename, "/data/data/");
+        strcat(staticfilename, procname);
+        strcat(staticfilename, "/static.txt");
+        staticfile.open(staticfilename);
+     } //todel
+        
+ /*       int openfd = open(filename, O_RDONLY, 0664);
         char buffer[MAX_CONTROL_VPACKET_SIZE];
         bzero(buffer, MAX_CONTROL_VPACKET_SIZE);
         // the parse result file is not present in server, load it from remote server
@@ -505,7 +523,7 @@ void* offControlLoop(void* junk) {
         } else {
             ALOGI("control server no need file pull");
         }
-    }
+    }*/
     // Modified end
     message_loop(s);
     close(gDvm.offNetPipe[0]);
@@ -676,8 +694,8 @@ bool offControlStartup(int afterZygote) {
 
     const char* env_server = getenv("OFF_SERVER");
     gDvm.isServer = env_server && !strcmp("1", env_server);
-    gDvm.methodExeTimeMap = new std::map<const Method*, u8>();
-
+    gDvm.methodExePointMap = new std::map<const Method*, u4>();
+    gDvm.methodExeCountMap = new std::map<char*, u4, charscomp>();
     res = offThreadingStartup() &&
           offDexLoaderStartup() && offCommStartup() &&
           offSyncStartup() && offMethodRulesStartup() &&
@@ -718,6 +736,7 @@ void offControlShutdown() {
     pthread_join(gDvm.offControlThread, NULL);
   }
 
+  staticfile.close();
   offSyncShutdown();
   offEngineShutdown();
   offCommShutdown();

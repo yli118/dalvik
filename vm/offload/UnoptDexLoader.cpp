@@ -29,12 +29,11 @@
 #include <zlib.h>
 
 static const char* kDexInJarName = "classes.dex";
-bool dexFirstLoad = true;
 ClassObject* javaLangObject;
 std::vector<ClassObject*>* exemptClzs = new std::vector<ClassObject*>();
 std::vector<ClassObject*>* exemptIfs = new std::vector<ClassObject*>();
 std::vector<DvmDex*> loadedDex;
-extern std::map<Method*, MethodAccInfo*> methodResMap;
+char* basePath;
 
 /*
  * Open a Jar file.  But we do not try to optimize the dex.
@@ -169,7 +168,7 @@ static bool prepareCpe(ClassPathEntry* cpe, bool isBootstrap)
     ALOGE("the name is: %s", name);
     getFileActualName(cpe->fileName, name, sizeof(name));
     char newname[80];
-    strcpy(newname, "/data/data/apkanalysis/");
+    strcpy(newname, "/home/yli118/apkanalysis/");
     strcat(newname, name);
     strcat(newname, ".class.dex");
 
@@ -354,9 +353,35 @@ void filterExempt(const char* className, ClassObject* resClass) {
             exemptIfs->push_back(resClass);
         } else if(strcmp(className, "Landroid/os/IBinder;") == 0) {
             exemptIfs->push_back(resClass);
+        } else if(strcmp(className, "Ljava/lang/Appendable;") == 0) {
+            exemptIfs->push_back(resClass);
+        } else if(strcmp(className, "Ljava/io/Closeable;") == 0) {
+            exemptIfs->push_back(resClass);
+        } else if(strcmp(className, "Ljava/lang/CharSequence;") == 0) {
+            exemptIfs->push_back(resClass);
+        } else if(strcmp(className, "Ljava/util/Enumeration;") == 0) {
+            exemptIfs->push_back(resClass);
+        } else if(strcmp(className, "Ljava/lang/Runnable;") == 0) {
+            exemptIfs->push_back(resClass);
         }
     } else {
         // filter class
+        if(strcmp(className, "Ljava/lang/StringBuilder;") == 0) {
+            exemptClzs->push_back(resClass);
+        } else if(strcmp(className, "Ljava/io/InputStream;") == 0) {
+            exemptClzs->push_back(resClass);
+        } else if(strcmp(className, "Ljava/io/OutputStream;") == 0) {
+            exemptClzs->push_back(resClass);
+        } else if(strcmp(className, "Ljava/io/Reader;") == 0) {
+            exemptClzs->push_back(resClass);
+        } else if(strcmp(className, "Ljava/io/Writer;") == 0) {
+            exemptClzs->push_back(resClass);
+        } else if(strcmp(className, "Ljava/util/Properties;") == 0) {
+            exemptClzs->push_back(resClass);
+        } else if(strcmp(className, "Ljava/util/prefs/XMLParser;") == 0) {
+            exemptClzs->push_back(resClass);
+        } else if(strcmp(className, "Lorg/apache/harmony/xnet/provider/jsse/OpenSSLSocketImpl;") == 0) { // skip for now
+            exemptClzs->push_back(resClass);
         //if(strcmp(className, "Ljava/util/AbstractMap;") == 0) {
          //   exemptClzs->push_back(resClass);
         //} else if(strcmp(className, "Ljava/util/AbstractCollection;") == 0) {
@@ -383,14 +408,20 @@ void filterExempt(const char* className, ClassObject* resClass) {
             exemptClzs->push_back(resClass);
         } else if(strcmp(className, "Ljava/io/OutputStream;") == 0) {
             exemptClzs->push_back(resClass);*/
-        /*} else {
+        } else {
             for(unsigned int j = 0; j < exemptClzs->size(); j++) {
                 if(dvmInstanceof(resClass, exemptClzs->at(j))) {
                     exemptClzs->push_back(resClass);
                     break;
                 }
             }
-        }*/
+            for(unsigned int j = 0; j < exemptIfs->size(); j++) {
+                if(dvmImplements(resClass, exemptIfs->at(j))) {
+                    exemptClzs->push_back(resClass);
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -410,72 +441,70 @@ void getPackageName(char* filepath, char* packageName, int len) {
 }
 
 void loadApk(char* apkPath) {
-    if(dexFirstLoad) {
-        ClassPathEntry* entry;
-        const char* bootPath = "/data/data/jars/core.jar:/data/data/jars/core-junit.jar:/data/data/jars/bouncycastle.jar:/data/data/jars/ext.jar:/data/data/jars/framework.jar:/data/data/jars/framework2.jar:/data/data/jars/android.policy.jar:/data/data/jars/services.jar:/data/data/jars/apache-xml.jar:";
-        char* classPath = new char[strlen(bootPath) + strlen(apkPath) + 1];
-        strcpy(classPath, bootPath);
-        strcat(classPath, apkPath);
-        entry = processClassPath(classPath);
-        delete[] classPath;
-        while (entry->kind != kCpeLastEntry) {
-            DvmDex* pDvmDex;
-            switch (entry->kind) {
-            case kCpeJar:
-                {
-                    JarFile* pJarFile = (JarFile*) entry->ptr;
-
-                    pDvmDex = dvmGetJarFileDex(pJarFile);
-                }
-                break;
-            case kCpeDex:
-                {
-                    RawDexFile* pRawDexFile = (RawDexFile*) entry->ptr;
-
-                    pDvmDex = dvmGetRawDexFileDex(pRawDexFile);
-                }
-                break;
-            default:
-                ALOGE("Unknown kind %d", entry->kind);
-                assert(false);
-                return;
+    ClassPathEntry* entry;
+    const char* bootPath = "/home/yli118/jars/core.jar:/home/yli118/jars/core-junit.jar:/home/yli118/jars/bouncycastle.jar:/home/yli118/jars/ext.jar:/home/yli118/jars/framework.jar:/home/yli118/jars/framework2.jar:/home/yli118/jars/android.policy.jar:/home/yli118/jars/services.jar:/home/yli118/jars/apache-xml.jar:";
+    char* classPath = new char[strlen(bootPath) + strlen(apkPath) + 1];
+    strcpy(classPath, bootPath);
+    //strcat(classPath, apkPath);
+    entry = processClassPath(classPath);
+    delete[] classPath;
+    while (entry->kind != kCpeLastEntry) {
+        DvmDex* pDvmDex;
+        switch (entry->kind) {
+        case kCpeJar:
+            {
+                JarFile* pJarFile = (JarFile*) entry->ptr;
+                pDvmDex = dvmGetJarFileDex(pJarFile);
             }
-            loadedDex.push_back(pDvmDex);
-            pDvmDex->pDexFile->pClassLookup = dexCreateClassLookup(pDvmDex->pDexFile);
-            entry++;
-        }
-//        makeClassLoader(&loadedDex);    
-        for(unsigned int idx = 0; idx < loadedDex.size(); idx++) {
-            DvmDex* pDvmDex;
-            pDvmDex = loadedDex[idx];
-//            Object* classLoader = pDvmDex->classLoader;
-            for(unsigned int i = 0; i < pDvmDex->pHeader->classDefsSize; i++) {
-                const DexClassDef pClassDef = pDvmDex->pDexFile->pClassDefs[i];
-                ClassObject* resClass;  // this segment is copied from Resolve.cpp - dvmResolveClass()
-                const char* className;
-                className = dexStringByTypeIdx(pDvmDex->pDexFile, pClassDef.classIdx);
-                /*if(strncmp(className, "Landroid/support/v4", 19) == 0) {
-                    continue;
-                }*/
-                if(className[0] != '\0' && className[1] == '\0') {
-                    /* primitive type */
-                    resClass = dvmFindPrimitiveClass(className[0]);
-                } else {
-                    //resClass = dvmFindClassNoInit(className, classLoader);
-                    resClass = customDefineClass(pDvmDex, className, NULL);
-                    if(strcmp(className, "Ljava/lang/Object;") == 0 && javaLangObject == NULL) {
-                        javaLangObject = resClass;
-                    }
-                    if(resClass == NULL) {
-                        ALOGE("find unloaded class: %s", className);
-                        continue;
-                    }
-                    filterExempt(className, resClass);
-                }
+            break;
+        case kCpeDex:
+            {
+                RawDexFile* pRawDexFile = (RawDexFile*) entry->ptr;
+                 pDvmDex = dvmGetRawDexFileDex(pRawDexFile);
             }
+            break;
+        default:
+            ALOGE("Unknown kind %d", entry->kind);
+            assert(false);
+            return;
         }
-        dexFirstLoad = false;
+        loadedDex.push_back(pDvmDex);
+        pDvmDex->pDexFile->pClassLookup = dexCreateClassLookup(pDvmDex->pDexFile);
+        entry++;
     }
+//        makeClassLoader(&loadedDex);    
+    for(unsigned int idx = 0; idx < loadedDex.size(); idx++) {
+        DvmDex* pDvmDex;
+        pDvmDex = loadedDex[idx];
+//      Object* classLoader = pDvmDex->classLoader;
+        for(unsigned int i = 0; i < pDvmDex->pHeader->classDefsSize; i++) {
+            const DexClassDef pClassDef = pDvmDex->pDexFile->pClassDefs[i];
+            ClassObject* resClass;  // this segment is copied from Resolve.cpp - dvmResolveClass()
+            const char* className;
+            className = dexStringByTypeIdx(pDvmDex->pDexFile, pClassDef.classIdx);
+            /*if(strncmp(className, "Landroid/support/v4", 19) == 0) {
+                continue;
+            }*/
+            if(className[0] != '\0' && className[1] == '\0') {
+                /* primitive type */
+                resClass = dvmFindPrimitiveClass(className[0]);
+            } else {
+                //resClass = dvmFindClassNoInit(className, classLoader);
+                resClass = customDefineClass(pDvmDex, className, NULL);
+                if(strcmp(className, "Ljava/lang/Object;") == 0 && javaLangObject == NULL) {
+                    javaLangObject = resClass;
+                }
+                if(resClass == NULL) {
+                    ALOGE("find unloaded class: %s", className);
+                    continue;
+                }
+                filterExempt(className, resClass);
+            }
+        }
+    }
+    /*for(unsigned int i = 0; i < exemptClzs->size(); i++) {
+        ALOGE("exempt clazz: %s", exemptClzs->at(i)->descriptor);
+    }*/
     char outFileName[160];
     char* BASE_PATH = getenv("OFFLOAD_PARSE_CACHE");
     if(BASE_PATH == NULL) {
@@ -486,13 +515,17 @@ void loadApk(char* apkPath) {
     char packageName[80];
     getPackageName(apkPath, packageName, 80);
     strcat(outFileName, packageName);
-    strcat(outFileName, ".txt");
-    std::ofstream dstfile;
-    dstfile.open(outFileName, std::ios::trunc);
-    dstfile.close();
-    
+    basePath = strdup(outFileName);
+
+    openFiles();
+    //createStringDict();
+    loadStringDict();
+    loadParsedMethodOffInfo();
+
+    for(unsigned int idx = 0; idx < loadedDex.size(); idx++) {
     DvmDex* pDvmDex;
-    pDvmDex = loadedDex[loadedDex.size() - 1];
+    pDvmDex = loadedDex[idx];
+//    pDvmDex = loadedDex[loadedDex.size() - 1];
 //    Object* classLoader = pDvmDex->classLoader;
     for(unsigned int i = 0; i < pDvmDex->pHeader->classDefsSize; i++) {
         const DexClassDef pClassDef = pDvmDex->pDexFile->pClassDefs[i];
@@ -527,25 +560,24 @@ void loadApk(char* apkPath) {
             if(dvmIsNativeMethod(method)) {
                 continue;
             }
-            ALOGE("start parse method: %s:%s, %u", method->clazz->descriptor, method->name, method->idx);
-            //if(strncmp(method->name, "matrixTest", 5) == 0) {
-            std::set<Method*>* chain = new std::set<Method*>();
-            MethodAccInfo* methodAccInfo = parseMethod(method, chain);
+            if((strcmp(method->clazz->descriptor, "Ljava/util/Properties;") == 0)
+              || (strcmp(method->clazz->descriptor, "Ljava/net/ContentHandler;") == 0)) { //&& strcmp(method->name, "printStackTrace") == 0)
+                    //|| (strcmp(method->clazz->descriptor, "Ljava/lang/Throwable;") == 0 && strcmp(method->name, "addSuppressed") == 0)) {
+                continue;
+            }
+            //if(strcmp(method->clazz->descriptor, "Ljava/util/GregorianCalendar;") == 0 && strcmp(method->name, "computeTime") == 0) {
+            //if(strcmp(method->clazz->descriptor, "Ledu/utk/offloadtest/MainActivity;") == 0 && strcmp(method->name, "matrixTest") == 0) {
+            //if(strcmp(method->clazz->descriptor, "Lorg/apache/harmony/xnet/provider/jsse/OpenSSLSocketImpl;") == 0 && strcmp(method->name, "startHandshake") == 0) { // long time execution - 5m
+                ALOGE("start parse method: %s:%s, %u", method->clazz->descriptor, method->name, method->idx);
+            std::vector<Method*>* chain = new std::vector<Method*>();
+            MethodAccInfo* methodAccInfo = new MethodAccInfo();
+            methodAccInfo->method = method;
+            parseMethod(methodAccInfo, chain);
             assert(chain->empty());
-            for(unsigned int k = 0; k < methodAccInfo->args->size(); k++) {
-            //    ALOGE("methodParser: for arg %d: ", k);
-                depthTraverse(methodAccInfo->args->at(k), 1);
-            }
-            for(unsigned int k = 0; k < methodAccInfo->globalClazz->size(); k++) {
-                assert(methodAccInfo->globalClazz->at(k) != NULL);
-            //    ALOGE("methodParser: for clazz %s: ", methodAccInfo->globalClazz->at(k)->clazz->descriptor);
-                depthTraverse(methodAccInfo->globalClazz->at(k), 1);
-            }
             delete chain;
             //methodResMap.erase(method);
-            //freeMethodAccInfo(methodAccInfo);
-            persistMethodInfo(methodAccInfo, outFileName);
-           //}
+            freeMethodAccInfo(methodAccInfo);
+            //}
         }
         Method* dmethods = resClass->directMethods;
         size_t dmethodCount = resClass->directMethodCount;
@@ -554,28 +586,29 @@ void loadApk(char* apkPath) {
             if(dvmIsNativeMethod(method)) {
                 continue;
             }
-            ALOGE("start parse method: %s:%s, %u", method->clazz->descriptor, method->name, method->idx);
-            //if(strncmp(method->name, "solve", 5) == 0) {
-            std::set<Method*>* chain = new std::set<Method*>();
-            MethodAccInfo* methodAccInfo = parseMethod(method, chain);
+            if((strcmp(method->clazz->descriptor, "Ljava/util/Properties;") == 0)
+              || (strcmp(method->clazz->descriptor, "Ljava/net/ContentHandler;") == 0)) { //&& strcmp(method->name, "printStackTrace") == 0)
+                    //|| (strcmp(method->clazz->descriptor, "Ljava/lang/Throwable;") == 0 && strcmp(method->name, "addSuppressed") == 0)) {
+                continue;
+            }
+            //if(strcmp(method->clazz->descriptor, "Ljava/util/GregorianCalendar;") == 0 && strcmp(method->name, "computeTime") == 0) {
+            //if(strcmp(method->clazz->descriptor, "Ledu/utk/offloadtest/MainActivity;") == 0 && strcmp(method->name, "matrixTest") == 0) {
+            //if(strcmp(method->clazz->descriptor, "Lorg/apache/harmony/xnet/provider/jsse/OpenSSLSocketImpl;") == 0 && strcmp(method->name, "startHandshake") == 0) {
+                ALOGE("start parse method: %s:%s, %u", method->clazz->descriptor, method->name, method->idx);
+            std::vector<Method*>* chain = new std::vector<Method*>();
+            MethodAccInfo* methodAccInfo = new MethodAccInfo();
+            methodAccInfo->method = method;
+            parseMethod(methodAccInfo, chain);
             assert(chain->empty());
-            for(unsigned int k = 0; k < methodAccInfo->args->size(); k++) {
-              //  ALOGE("methodParser: for arg %d: ", k);
-                depthTraverse(methodAccInfo->args->at(k), 1);
-            }
-            for(unsigned int k = 0; k < methodAccInfo->globalClazz->size(); k++) {
-                assert(methodAccInfo->globalClazz->at(k) != NULL);
-            //    ALOGE("methodParser: for clazz %s: ", methodAccInfo->globalClazz->at(k)->clazz->descriptor);
-                depthTraverse(methodAccInfo->globalClazz->at(k), 1);
-            }
             delete chain;
             //methodResMap.erase(method);
-            //freeMethodAccInfo(methodAccInfo);
-            persistMethodInfo(methodAccInfo, outFileName);
+            freeMethodAccInfo(methodAccInfo);
             //}
         }
     }
-    gDvm.methodAccMap = new std::map<char*, MethodAccResult*, charscomp>();
+    }
+    closeFiles();
+    /*gDvm.methodAccMap = new std::map<char*, MethodAccResult*, charscomp>();
     retrieveMethodInfo(gDvm.methodAccMap, outFileName);
     ALOGE("method ACc vec size: %u", gDvm.methodAccMap->size());
     for (std::map<char*, MethodAccResult*>::iterator it = gDvm.methodAccMap->begin(); it != gDvm.methodAccMap->end(); ++it) {
@@ -585,10 +618,10 @@ void loadApk(char* apkPath) {
         //    ALOGE("methodParser: for arg %d: ", j);
             depthTraverseResult(methodAccResult->args->at(j), 1);
         }
-        /*for(unsigned int j = 0; j < methodAccResult->globalClazz->size(); j++) {
+        for(unsigned int j = 0; j < methodAccResult->globalClazz->size(); j++) {
         //    ALOGE("methodParser: for clazz %s: ", methodAccResult->globalClazz->at(j)->clazz);
             depthTraverseResult(methodAccResult->globalClazz->at(j), 1);
-        }*/
-    }
+        }
+    }*/
     
 }

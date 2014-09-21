@@ -18,16 +18,21 @@ struct BitsVec {
 struct ObjectAccInfo {
     // flag indicates that all the attribute of the object should be marked as accessed to assure correctness
     bool allFlag;
+    // flag incates that the object can be accessed from an array
+    bool inArray;
+    // flag which indicates that this field have a branch involving no access
+    std::vector<bool> nullBranchFlags;
     // recursively indicates the fields of the object
     std::vector<ObjectAccInfo*> fieldSet;
     // recursively indicates the current attributes of the object which need to be tracked
-    std::vector<std::vector<ObjectAccInfo*>* > trackSet;
+    std::vector<std::set<ObjectAccInfo*>* > trackSet;
     // set for merge to be able to save temporary result
-    std::vector<std::vector<ObjectAccInfo*>* > mergeSet;
+    std::vector<std::set<ObjectAccInfo*>* > mergeSet;
     // Object which this field belongs to
     ObjectAccInfo* belonging;
-    // flag incates that the object can be accessed from an array
-    bool inArray;
+    int idx;
+    
+    ObjectAccInfo() : allFlag(false), inArray(false), belonging(NULL), idx(-1) {}
 };
 
 /* structure indicates which fields of object have been accessed */
@@ -48,10 +53,30 @@ struct MethodAccInfo {
     std::vector<ClazzAccInfo*>* globalClazz;
     
     // objects which represents the possible returns
-    std::vector<ObjectAccInfo*>* returnObjs;
+    std::set<ObjectAccInfo*>* returnObjs;
     
-    // objects which represents the possible returns
-    std::vector<ObjectAccInfo*>* curMethodReturns;
+    // objects which represents the possible returns for the method invocation in parsing
+    std::set<ObjectAccInfo*>* curMethodReturns;
+};
+
+struct ParseInfo {
+    /* indicate if a register change will affect the try / catch parsing */
+    bool affectTry;
+    
+    /* the instruction offset of the current parsing path */
+    int insoff;
+    
+    /* last instruction of the current parsing path */
+    Opcode lastop;
+    
+    /* the instruction offsets along the current parsing path */
+    std::set<int>* insOffsets;
+    
+    /* the interesting register states */
+    std::map<u2, std::set<ObjectAccInfo*> >* interestRegObjMap;
+    
+    /* method access information */
+    MethodAccInfo* methodAccInfo;
 };
 
 struct ObjectAccResult {
@@ -87,12 +112,13 @@ struct MethodAccResult {
 
 
 void populateMethodAccInfo(MethodAccInfo* methodAccInfo);
-MethodAccInfo* parseMethod(Method* method, std::set<Method*>* chain);
+void parseMethod(MethodAccInfo* methodAccInfo, std::vector<Method*>* chain);
 std::vector<ClassObject*>* findSubClass(ClassObject* clazz);
 std::vector<ClassObject*>* findImplementClass(ClassObject* clazz);
 void depthTraverse(ObjectAccInfo* objAccInfo, int depth);
 void freeMethodAccInfo(MethodAccInfo* methodAccInfo);
 void persistMethodInfo(MethodAccInfo* methodAccInfo, const char* fileName);
+void persistMethodAllInfo(MethodAccInfo* methodAccInfo);
 void retrieveMethodInfo(std::map<char*, MethodAccResult*, charscomp>* methodAccMap, const char* fileName);
 void depthTraverseResult(ObjectAccResult* objAccResult, int depth);
 ClassObject* resolveClass(const ClassObject* referrer, u4 classIdx, bool fromUnverifiedConstant);
@@ -100,4 +126,8 @@ Method* resolveMethod(const ClassObject* referrer, u4 methodIdx, MethodType meth
 Method* resolveInterfaceMethod(const ClassObject* referrer, u4 methodIdx);
 InstField* resolveInstField(const ClassObject* referrer, u4 ifieldIdx);
 StaticField* resolveStaticField(const ClassObject* referrer, u4 sfieldIdx);
-
+void openFiles();
+void closeFiles();
+void createStringDict();
+void loadStringDict();
+void loadParsedMethodOffInfo();

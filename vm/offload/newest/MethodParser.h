@@ -5,6 +5,14 @@
 #include <iostream>
 #include <fstream>
 #include <string>
+#include <set>
+
+struct charscomp;
+
+struct BitsVec {
+    u4* bits;
+    u4 size;
+};
 
 /* structure indicates which fields of object have been accessed */
 struct ObjectAccInfo {
@@ -13,11 +21,16 @@ struct ObjectAccInfo {
     // recursively indicates the fields of the object
     std::vector<ObjectAccInfo*> fieldSet;
     // recursively indicates the current attributes of the object which need to be tracked
-    std::vector<std::vector<ObjectAccInfo*>* > trackSet;
+    std::vector<std::set<ObjectAccInfo*>* > trackSet;
     // set for merge to be able to save temporary result
-    std::vector<std::vector<ObjectAccInfo*>* > mergeSet;
+    std::vector<std::set<ObjectAccInfo*>* > mergeSet;
     // Object which this field belongs to
     ObjectAccInfo* belonging;
+    // flag incates that the object can be accessed from an array
+    bool inArray;
+    int idx;
+    
+    ObjectAccInfo() : allFlag(false), belonging(NULL), inArray(false), idx(-1) {}
 };
 
 /* structure indicates which fields of object have been accessed */
@@ -38,10 +51,10 @@ struct MethodAccInfo {
     std::vector<ClazzAccInfo*>* globalClazz;
     
     // objects which represents the possible returns
-    std::vector<ObjectAccInfo*>* returnObjs;
+    std::set<ObjectAccInfo*>* returnObjs;
     
     // objects which represents the possible returns
-    std::vector<ObjectAccInfo*>* curMethodReturns;
+    std::set<ObjectAccInfo*>* curMethodReturns;
 };
 
 struct ObjectAccResult {
@@ -49,6 +62,12 @@ struct ObjectAccResult {
     bool allFlag;
     // recursively indicates the fields of the object
     std::vector<ObjectAccResult*> fieldSet;
+   
+    /* Tracks the neccessity of migrating low field indexes. */
+    u4 migrate;
+
+    /* Tracks the dirtiness of high field indexes. */
+    u4* highbits;
 };
 
 /* structure indicates which fields of object have been accessed */
@@ -58,23 +77,32 @@ struct ClazzAccResult : ObjectAccResult {
 };
 
 struct MethodAccResult {
-    char* clazzDesc;
+    //char* clazzDesc;
     
-    char* methodName;
+    //char* methodName;
     
-    u4 idx;
+    //u4 idx;
     
     std::vector<ObjectAccResult*>* args;
     
     std::vector<ClazzAccResult*>* globalClazz;
 };
 
+
 void populateMethodAccInfo(MethodAccInfo* methodAccInfo);
-MethodAccInfo* parseMethod(Method* method, std::vector<Method*>* chain);
-void findSubClass(ClassObject* clazz, std::vector<ClassObject*>* result);
-void findImplementClass(ClassObject* clazz, std::vector<ClassObject*>* result);
+MethodAccInfo* parseMethod(Method* method, std::set<Method*>* chain);
+std::vector<ClassObject*>* findSubClass(ClassObject* clazz);
+std::vector<ClassObject*>* findImplementClass(ClassObject* clazz);
 void depthTraverse(ObjectAccInfo* objAccInfo, int depth);
 void freeMethodAccInfo(MethodAccInfo* methodAccInfo);
 void persistMethodInfo(MethodAccInfo* methodAccInfo, const char* fileName);
-void retrieveMethodInfo(std::vector<MethodAccResult*>* methodAccVec, const char* fileName);
+void persistMethodAllInfo(MethodAccInfo* methodAccInfo, const char* fileName);
+void retrieveMethodInfo(std::map<char*, MethodAccResult*, charscomp>* methodAccMap, const char* fileName);
+void loadStructureInFile(MethodAccInfo* methodAccInfo, const char* fileName);
 void depthTraverseResult(ObjectAccResult* objAccResult, int depth);
+ClassObject* resolveClass(const ClassObject* referrer, u4 classIdx, bool fromUnverifiedConstant);
+Method* resolveMethod(const ClassObject* referrer, u4 methodIdx, MethodType methodType);
+Method* resolveInterfaceMethod(const ClassObject* referrer, u4 methodIdx);
+InstField* resolveInstField(const ClassObject* referrer, u4 ifieldIdx);
+StaticField* resolveStaticField(const ClassObject* referrer, u4 sfieldIdx);
+

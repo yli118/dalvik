@@ -7,4 +7,7 @@
 #include <string>
 #include <set>
 
+void loadKernel();
 void loadApkStatic(char* apkPath);
+void retrieveOffsetMap(std::map<char*, u4, charscomp>* offsetMap, char* filename);
+

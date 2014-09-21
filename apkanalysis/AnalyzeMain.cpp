@@ -157,16 +157,12 @@ static Thread* allocThread(int interpStackSize)
     thread->offFlagMigration = false;
     thread->offFlagDeath = false;
     thread->offTrimSignaled = false;
-    thread->offSyncStackStop = NULL;
     thread->offWriteBuffer = auxFifoCreate();
     thread->offReadBuffer = auxFifoCreate();
-    thread->offTimeCounter = 0;
     pthread_mutex_init(&thread->offBufferLock, NULL);
     pthread_cond_init(&thread->offBufferCond, NULL);
     thread->offCorkLevel = 0;
     thread->offProtection = 0;
-
-    offSchedulerUnsafePoint(thread);
 
     memset(thread->offLockList, 0, sizeof(thread->offLockList));
 #endif
@@ -404,7 +400,9 @@ int main(int argc, char** argv) {
     offControlStartup(false);
     dvmInstanceofStartup();
     
-    if(strcmp(argv[1], "-s")) {
+    if(!strcmp(argv[1], "-k")) {
+        loadKernel();
+    } else if(strcmp(argv[1], "-s")) {
         char* apkPath = argv[1];
         loadApk(apkPath);
     } else {

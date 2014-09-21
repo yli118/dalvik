@@ -329,8 +329,7 @@ struct Thread {
     bool             offFlagDeath;
     bool             offTrimSignaled;
     bool             isMethodStart;    /* indicate if the migration happening at the start of method */
-    bool             isMethodReturn;   /* indicate if the migration happening at the return of method */
-    u1               returnType;     /* indicate if the return is void */
+    u1               returnType;     /* indicate the type of migrating back, v: return void, w: return wide, i: return one word value type, o: return object, e: exception */
 //    void*            offSyncStackStop;//todel
     u4*              offStackFpStop;  /* frame pointer where migration should stop */
 
